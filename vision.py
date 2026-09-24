@@ -1,0 +1,278 @@
+"""
+vision.py - camera -> objects on the belt (id, class, position in cm, speed in cm/s).
+
+Modes (config.VISION["mode"]):
+  "yolo"  read the MJPEG stream of the ESP32-CAM, detect + track with Ultralytics YOLO
+  "sim"   no camera: fake objects that ride on the measured belt speed (to test the twin)
+  "off"   vision disabled
+
+Both modes feed the same pipeline (VisionBase.process), which
+  * converts pixels to belt centimetres using the calibrated ROI,
+  * keeps a track per object and fits its speed,
+  * predicts where the object should be from the ENCODER travel (used by the divergence rule),
+  * writes cam_* variables, state.objects and an annotated JPEG for the browser,
+  * publishes the result on MQTT (config.VISION["publish_topic"]).
+
+To add a new kind of measurement, edit VisionBase.process().
+"""
+import json
+import threading
+import time
+from collections import deque
+
+import cv2
+import numpy as np
+
+import config as cfg
+from state import state
+
+V = cfg.VISION
+L = cfg.BELT_LENGTH_CM
+
+
+# ── calibration helpers (read live from the "Camera calibration" controls) ──────────────
+def roi():
+    p, d = state.params, V["belt_roi_px"]
+    return (p.get("roi_x1", d[0]), p.get("roi_y1", d[1]), p.get("roi_x2", d[2]), p.get("roi_y2", d[3]))
+
+
+def flipped():
+    return bool(state.params.get("flip_x", V["flip_x"]))
+
+
+def px_to_cm(cx):
+    x1, _, x2, _ = roi()
+    cm = (cx - x1) / max(1.0, (x2 - x1)) * L
+    return L - cm if flipped() else cm
+
+
+def cm_to_px(cm):
+    x1, _, x2, _ = roi()
+    frac = (L - cm if flipped() else cm) / L
+    return x1 + frac * (x2 - x1)
+
+
+# ── placeholder + overlay ───────────────────────────────────────────────────────────────
+def placeholder_jpeg(text):
+    img = np.full((360, 640, 3), (236, 239, 243), np.uint8)
+    cv2.putText(img, text, (30, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (90, 100, 115), 2, cv2.LINE_AA)
+    return cv2.imencode(".jpg", img)[1].tobytes()
+
+
+def draw_overlay(img, objs):
+    x1, y1, x2, y2 = [int(v) for v in roi()]
+    cv2.rectangle(img, (x1, y1), (x2, y2), (200, 140, 20), 1)
+    for cm in range(0, int(L) + 1, 10):
+        px = int(cm_to_px(cm))
+        cv2.line(img, (px, y1), (px, y1 + 12), (200, 140, 20), 1)
+        cv2.putText(img, str(cm), (px + 2, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 140, 20), 1, cv2.LINE_AA)
+    for o in objs:
+        bx1, by1, bx2, by2 = [int(v) for v in o["box"]]
+        col = (50, 50, 220) if o.get("diverging") else (90, 190, 60)
+        cv2.rectangle(img, (bx1, by1), (bx2, by2), col, 2)
+        spd = "" if o["speed_cm_s"] is None else f"  {o['speed_cm_s']:+.1f}cm/s"
+        cv2.putText(img, f"#{o['id']} {o['label']} {o['x_cm']:.1f}cm{spd}", (bx1, max(14, by1 - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+    return img
+
+
+# ── tracking ───────────────────────────────────────────────────────────────────────────
+class TrackBook:
+    """Keeps a history per object id and derives speed + encoder-based expected position."""
+
+    def __init__(self):
+        self.tracks = {}
+
+    def update(self, dets, t):
+        travel = state.travel_real
+        for d in dets:
+            tr = self.tracks.get(d["tid"])
+            if tr is None:
+                tr = dict(id=d["tid"], x0=d["x_cm"], travel0=travel, t0=t, hist=deque())
+                self.tracks[d["tid"]] = tr
+            tr.update(label=d["label"], x=d["x_cm"], conf=d.get("conf", 1.0), box=d["box"], last=t)
+            tr["hist"].append((t, d["x_cm"]))
+            while tr["hist"] and t - tr["hist"][0][0] > V["speed_window_s"]:
+                tr["hist"].popleft()
+        for k in [k for k, tr in self.tracks.items() if t - tr["last"] > V["lost_after_s"]]:
+            del self.tracks[k]
+
+        out = []
+        for tr in self.tracks.values():
+            if tr["last"] != t:                       # not visible in this frame
+                continue
+            speed = None
+            if len(tr["hist"]) >= 3 and tr["hist"][-1][0] - tr["hist"][0][0] >= 0.4:
+                ts = np.array([h[0] for h in tr["hist"]]) - tr["hist"][0][0]
+                xs = np.array([h[1] for h in tr["hist"]])
+                speed = float(np.polyfit(ts, xs, 1)[0])
+            age = t - tr["t0"]
+            expected = tr["x0"] + (travel - tr["travel0"])
+            err = (tr["x"] - expected) if (age >= 0.5 and 0 <= expected <= L) else None
+            out.append(dict(id=tr["id"], label=tr["label"], x_cm=tr["x"], speed_cm_s=speed, expected_cm=expected,
+                            err_cm=err, conf=tr["conf"], age_s=age, box=tr["box"], diverging=False))
+        return out
+
+
+class VisionBase(threading.Thread):
+    def __init__(self, bridge):
+        super().__init__(daemon=True, name="vision")
+        self.bridge = bridge
+        self.book = TrackBook()
+        self._stamps = deque(maxlen=15)
+        self._last_pub = 0.0
+
+    def run(self):
+        try:
+            self.loop()
+        except Exception as e:                       # never die silently
+            import traceback
+            traceback.print_exc()
+            state.vision_status = f"error: {e}"
+            state.log(f"Vision stopped: {e}", "alert")
+
+    def process(self, dets, t):
+        objs = self.book.update(dets, t)
+        state.objects = objs
+        state.set_value("cam_objects", len(objs))
+
+        speeds = [o["speed_cm_s"] for o in objs if o["speed_cm_s"] is not None and o["age_s"] >= 0.6]
+        if speeds:
+            state.set_value("cam_belt_speed_cm_s", float(np.median(speeds)))
+
+        self._stamps.append(t)
+        if len(self._stamps) >= 2 and self._stamps[-1] > self._stamps[0]:
+            state.set_value("cam_fps", (len(self._stamps) - 1) / (self._stamps[-1] - self._stamps[0]))
+
+        if self.bridge and t - self._last_pub >= 1.0 / V["publish_hz"]:
+            self._last_pub = t
+            payload = dict(ts=t, belt_speed_cm_s=state.get("cam_belt_speed_cm_s"), objects=[
+                dict(id=o["id"], label=o["label"], x_cm=round(o["x_cm"], 2),
+                     speed_cm_s=None if o["speed_cm_s"] is None else round(o["speed_cm_s"], 2)) for o in objs])
+            self.bridge.publish(V["publish_topic"], json.dumps(payload), qos=0, quiet=True)
+        return objs
+
+    @staticmethod
+    def show(frame, objs):
+        frame = draw_overlay(frame, objs)
+        if frame.shape[1] > 800:
+            s = 800.0 / frame.shape[1]
+            frame = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        state.jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
+
+
+# ── real camera + YOLO ─────────────────────────────────────────────────────────────────
+class CameraReader(threading.Thread):
+    """Always keeps only the newest frame so slow inference never adds latency."""
+
+    def __init__(self, url):
+        super().__init__(daemon=True, name="camera-reader")
+        self.url = int(url) if str(url).isdigit() else url
+        self.frame, self.t, self.seq = None, 0.0, 0
+
+    def run(self):
+        while True:
+            cap = cv2.VideoCapture(self.url)
+            if not cap.isOpened():
+                state.vision_status = f"cannot open {self.url}"
+                time.sleep(2)
+                continue
+            while True:
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                self.frame, self.t, self.seq = frame, time.time(), self.seq + 1
+            cap.release()
+            time.sleep(1)
+
+
+class YoloVision(VisionBase):
+    def loop(self):
+        try:
+            from ultralytics import YOLO
+        except ImportError:
+            state.vision_status = "ultralytics not installed"
+            state.log("pip install ultralytics  (or set VISION['mode'] = 'sim' / 'off')", "alert")
+            return
+        state.vision_status = "loading model"
+        model = YOLO(V["model"])
+        reader = CameraReader(V["camera_url"])
+        reader.start()
+        state.vision_status = f"connecting to {V['camera_url']}"
+
+        last_seq, last_inf, last_frame_t = 0, 0.0, time.time()
+        objs = []
+        while True:
+            if reader.seq == last_seq:
+                if time.time() - last_frame_t > 2.0 and reader.seq > 0:
+                    state.vision_status = "no frames"
+                    state.objects = []
+                time.sleep(0.005)
+                continue
+            frame, t, last_seq = reader.frame.copy(), reader.t, reader.seq
+            last_frame_t = time.time()
+            state.vision_status = "streaming"
+
+            if t - last_inf >= 1.0 / V["infer_fps"]:
+                last_inf = t
+                res = model.track(frame, persist=True, tracker=V["tracker"], conf=V["conf"], imgsz=V["imgsz"],
+                                  classes=V["classes"], device=V["device"], verbose=False)[0]
+                objs = self.process(self._detections(res, model.names), t)
+            self.show(frame, objs)
+
+    @staticmethod
+    def _detections(res, names):
+        boxes = res.boxes
+        if boxes is None or boxes.id is None:
+            return []
+        x1, y1, x2, y2 = roi()
+        dets = []
+        for (bx1, by1, bx2, by2), tid, c, cf in zip(boxes.xyxy.cpu().numpy(), boxes.id.int().cpu().tolist(),
+                                                     boxes.cls.int().cpu().tolist(), boxes.conf.cpu().numpy()):
+            cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
+            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
+                continue                                   # outside the belt
+            dets.append(dict(tid=tid, label=names[c], x_cm=float(px_to_cm(cx)), conf=float(cf), box=(bx1, by1, bx2, by2)))
+        return dets
+
+
+# ── simulated vision (no camera needed) ────────────────────────────────────────────────
+class SimVision(VisionBase):
+    def loop(self):
+        state.vision_status = "simulated"
+        objs, next_id, last_spawn, prev = [], 1, 0.0, time.time()
+        while True:
+            time.sleep(0.05)
+            now = time.time()
+            dt, prev = now - prev, now
+            v = state.get("belt_speed_cm_s") or 0.0
+            for o in objs:
+                o["x"] += v * V["sim_slip"] * dt
+            objs = [o for o in objs if 0 <= o["x"] <= L]
+            if now - last_spawn > V["sim_spawn_every_s"] and len(objs) < 3 and abs(v) > 1.0:
+                objs.append(dict(id=next_id, x=2.0 if v > 0 else L - 2.0))
+                next_id, last_spawn = next_id + 1, now
+
+            _, y1, _, y2 = roi()
+            cy = (y1 + y2) / 2
+            dets = [dict(tid=o["id"], label="box", x_cm=o["x"], conf=1.0,
+                         box=(cm_to_px(o["x"]) - 25, cy - 25, cm_to_px(o["x"]) + 25, cy + 25)) for o in objs]
+            out = self.process(dets, now)
+
+            img = np.full((480, 640, 3), (236, 239, 243), np.uint8)
+            rx1, ry1, rx2, ry2 = [int(x) for x in roi()]
+            cv2.rectangle(img, (rx1, ry1), (rx2, ry2), (95, 105, 120), -1)
+            for o in out:
+                b = [int(x) for x in o["box"]]
+                cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (60, 130, 220), -1)
+            self.show(img, out)
+
+
+def start(bridge):
+    mode = V["mode"]
+    state.jpeg = placeholder_jpeg("No camera signal" if mode != "off" else "Vision disabled")
+    if mode == "off":
+        state.vision_status = "off"
+        return
+    worker = SimVision(bridge) if mode == "sim" else YoloVision(bridge)
+    worker.start()
