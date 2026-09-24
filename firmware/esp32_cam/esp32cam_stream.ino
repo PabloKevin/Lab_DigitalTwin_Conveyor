@@ -15,6 +15,7 @@
 */
 
 #include "esp_camera.h"
+#include "img_converters.h"
 #include <WiFi.h>
 #include <ESPmDNS.h>
 #include "esp_http_server.h"
@@ -25,10 +26,19 @@ const char* HOSTNAME  = "esp32cam";          // reachable as esp32cam.local (mDN
 
 // Frame size values: 5=QVGA(320x240) 8=VGA(640x480) 9=SVGA(800x600) 10=XGA(1024x768)
 //                    11=HD(1280x720) 12=SXGA(1280x1024) 13=UXGA(1600x1200)
-#define FRAME_SIZE    FRAMESIZE_SVGA
+#define FRAME_SIZE    FRAMESIZE_VGA
 #define JPEG_QUALITY  12          // 10 = best/biggest ... 63 = worst/smallest
 #define XCLK_HZ       20000000    // try 10000000 if you see garbage/green frames
 #define FLIP_VERTICAL 1           // the OV3660 on most boards comes out upside down
+
+// The belt only occupies the middle band of the frame (see the lab photo), so we crop the sensor
+// output to the middle third vertically BEFORE sending it over WiFi: about 1/3 the pixels and
+// roughly 1/3 the JPEG bytes per frame, which is most of the latency on a slow WiFi link. This
+// requires capturing raw pixels (PIXFORMAT_RGB565) instead of the camera's own hardware JPEG
+// encoder, then cropping the raw rows (cheap: they are just contiguous memory) and JPEG-encoding
+// only the cropped band in software (frame2jpg). Set to 0 to go back to sending the full,
+// hardware-JPEG-encoded frame (less CPU work on the ESP32, more bytes over WiFi).
+#define CROP_MIDDLE_THIRD 1
 // =========================================================
 
 // AI Thinker ESP32-CAM pin map
@@ -57,6 +67,22 @@ static const char* STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Le
 httpd_handle_t web_httpd    = NULL;
 httpd_handle_t stream_httpd = NULL;
 
+// Crops a raw RGB565 frame to its middle third (by rows) and JPEG-encodes just that band in
+// software. Raw rows are contiguous in memory, so the crop itself is just pointer arithmetic - no
+// copy needed. Returns true and fills *out/*out_len (caller must free(*out)) on success; false if
+// fb isn't a raw format we can crop (hardware JPEG, i.e. CROP_MIDDLE_THIRD off or no PSRAM) - the
+// caller should then send fb->buf/fb->len unmodified.
+static bool cropAndEncode(camera_fb_t *fb, uint8_t **out, size_t *out_len) {
+  if (fb->format != PIXFORMAT_RGB565) return false;
+  const size_t bypp = 2;                     // bytes per pixel, RGB565
+  camera_fb_t crop = *fb;                    // shallow copy: reuse width/format/timestamp
+  crop.height = fb->height / 3;
+  crop.buf    = fb->buf + crop.height * fb->width * bypp;   // skip the top third
+  crop.len    = crop.height * fb->width * bypp;
+  sensor_t *s = esp_camera_sensor_get();     // honour the live "JPEG quality" control (/control?var=quality)
+  return frame2jpg(&crop, s ? s->status.quality : JPEG_QUALITY, out, out_len);
+}
+
 // ---------------------------------------------------------------- handlers
 static esp_err_t index_handler(httpd_req_t *req) {
   static const char page[] =
@@ -78,7 +104,16 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   snprintf(ts, sizeof(ts), "%ld.%06ld", (long)fb->timestamp.tv_sec, (long)fb->timestamp.tv_usec);
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "X-Timestamp", ts);
-  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+
+  uint8_t *jpg = NULL;
+  size_t jpg_len = 0;
+  esp_err_t res;
+  if (cropAndEncode(fb, &jpg, &jpg_len)) {
+    res = httpd_resp_send(req, (const char *)jpg, jpg_len);
+    free(jpg);
+  } else {
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  }
   esp_camera_fb_return(fb);
   return res;
 }
@@ -100,16 +135,22 @@ static esp_err_t stream_handler(httpd_req_t *req) {
       break;
     }
 
+    uint8_t *jpg = NULL;
+    size_t jpg_len = 0;
+    bool cropped = cropAndEncode(fb, &jpg, &jpg_len);
+    const uint8_t *send_buf = cropped ? jpg : fb->buf;
+    size_t send_len = cropped ? jpg_len : fb->len;
+
     res = httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
     if (res == ESP_OK) {
-      size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, (unsigned)fb->len,
+      size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, (unsigned)send_len,
                              (long)fb->timestamp.tv_sec, (long)fb->timestamp.tv_usec);
       res = httpd_resp_send_chunk(req, part_buf, hlen);
     }
     if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+      res = httpd_resp_send_chunk(req, (const char *)send_buf, send_len);
     }
-    size_t jpg_len = fb->len;
+    if (cropped) free(jpg);
     esp_camera_fb_return(fb);
     if (res != ESP_OK) break;   // client disconnected
 
@@ -117,7 +158,7 @@ static esp_err_t stream_handler(httpd_req_t *req) {
     int64_t now = esp_timer_get_time();
     if (now - t_report > 5000000) {
       Serial.printf("stream: %.1f fps, last frame %u KB\n",
-                    frames * 1e6f / (now - t_report), (unsigned)(jpg_len / 1024));
+                    frames * 1e6f / (now - t_report), (unsigned)(send_len / 1024));
       frames = 0;
       t_report = now;
     }
@@ -208,13 +249,24 @@ void setup() {
   config.grab_mode    = CAMERA_GRAB_LATEST;      // always give the newest frame (low latency)
 
   if (psramFound()) {
-    config.fb_count    = 2;
+#if CROP_MIDDLE_THIRD
+    // Raw capture needed to crop rows before JPEG-encoding (see cropAndEncode()). Raw frames are
+    // much bigger than JPEG (VGA RGB565 = 614 KB vs a few tens of KB), so one frame buffer is
+    // enough - PSRAM headroom matters more here than double-buffering.
+    config.pixel_format = PIXFORMAT_RGB565;
+    config.fb_count     = 1;
+#else
+    config.fb_count     = 2;
+#endif
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    Serial.println("WARNING: no PSRAM found -> falling back to small frames");
-    config.frame_size  = FRAMESIZE_VGA;
-    config.fb_count    = 1;
-    config.fb_location = CAMERA_FB_IN_DRAM;
+    // No PSRAM: not enough internal RAM for a raw frame buffer, so always fall back to the
+    // camera's own hardware JPEG encoder at a small frame size, regardless of CROP_MIDDLE_THIRD.
+    Serial.println("WARNING: no PSRAM found -> falling back to small hardware-JPEG frames (no crop)");
+    config.pixel_format = PIXFORMAT_JPEG;
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.fb_count     = 1;
+    config.fb_location  = CAMERA_FB_IN_DRAM;
   }
 
   esp_err_t err = esp_camera_init(&config);

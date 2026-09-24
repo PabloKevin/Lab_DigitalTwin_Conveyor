@@ -35,6 +35,14 @@ ROLLER_RADIUS_CM = 1.30     # drive roller radius (lab guide: r = 5 cm)
 MAX_RPM = 300.0            # RPM at 100 % speed (same mapping as the Arduino code)
 ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 
+# Physical ground-truth reference glued/taped onto the belt, used to check and fine-tune the
+# camera calibration (belt_roi_px below). Measured by hand with a ruler:
+#   - x_start_cm: distance from the centre of the LEFT roller (= x = 0 cm) to the start of the mark
+#   - width_cm:   horizontal width of the mark
+# vision.py draws this as a yellow reference on the camera overlay; nudge roi_x1/roi_x2 (Camera
+# calibration controls) until the yellow mark lines up with the real mark in the image.
+CALIBRATION_MARK = dict(x_start_cm=28.7, width_cm=4.0)
+
 # ════════════════════════════════════════════════════════════════════════════
 # Web app
 # ════════════════════════════════════════════════════════════════════════════
@@ -54,16 +62,19 @@ VISION = dict(
     camera_control_url="http://esp32cam.local",
     model="yolo11n.pt",    # any Ultralytics weights; use your own trained .pt for your objects
     conf=0.35,
-    imgsz=320,             # match the camera frame size: 320 for QVGA, 640 for VGA
+    imgsz=640,             # match the camera frame size (see firmware: VGA 640 wide, cropped to the middle third vertically -> 640x160)
     device=None,           # None = auto, "cpu", "cuda:0", "mps"
     classes=None,          # e.g. [39, 41] to keep only some COCO classes; None = all
     tracker="bytetrack.yaml",
     infer_fps=10,          # max inferences per second
     # Region of the image that contains the belt (x1, y1, x2, y2) in pixels OF THE CAMERA FRAME.
     # x1 -> 0 cm and x2 -> BELT_LENGTH_CM. Tune it live in the "Camera calibration" controls.
-    # Defaults are for QVGA 320x240 (FRAMESIZE_QVGA). For VGA 640x480 use about (20, 60, 620, 420).
-    # If you change the frame size in the firmware, re-do the calibration.
-    belt_roi_px=(10, 30, 310, 210),
+    # Defaults are for the firmware's cropped frame: 640x160 (VGA 640x480, middle third kept, see esp32cam_stream.ino).
+    # If you change the frame size / crop in the firmware, re-do the calibration.
+    # Use CALIBRATION_MARK below (the red square on the belt) as a ground-truth reference while tuning roi_x1/roi_x2:
+    # its expected pixel position is drawn on the camera overlay as a yellow marker - move the ROI sliders until
+    # the yellow mark lines up with the real red square in the image.
+    belt_roi_px=(10, 10, 630, 150),
     flip_x=False,          # True if the camera sees the belt mirrored (forward = towards the left)
     speed_window_s=1.0,    # window used to fit each object's speed
     lost_after_s=1.5,      # forget a track not seen for this long

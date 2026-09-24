@@ -68,6 +68,17 @@ def draw_overlay(img, objs):
         px = int(cm_to_px(cm))
         cv2.line(img, (px, y1), (px, y1 + 12), (200, 140, 20), 1)
         cv2.putText(img, str(cm), (px + 2, y1 + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 140, 20), 1, cv2.LINE_AA)
+
+    # ground-truth calibration mark (physical reference glued on the belt, see config.CALIBRATION_MARK):
+    # drawn where the ROI says it SHOULD be - line the ROI sliders up until this lands on the real mark.
+    mk = cfg.CALIBRATION_MARK
+    mx1, mx2 = int(cm_to_px(mk["x_start_cm"])), int(cm_to_px(mk["x_start_cm"] + mk["width_cm"]))
+    my = y1 - 10
+    cv2.rectangle(img, (min(mx1, mx2), my - 8), (max(mx1, mx2), my), (255, 210, 0), 1, cv2.LINE_AA)
+    for px in (mx1, mx2):
+        cv2.line(img, (px, y1), (px, y2), (255, 210, 0), 1, cv2.LINE_4)
+    cv2.putText(img, "ref mark", (min(mx1, mx2), my - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 210, 0), 1, cv2.LINE_AA)
+
     for o in objs:
         bx1, by1, bx2, by2 = [int(v) for v in o["box"]]
         col = (50, 50, 220) if o.get("diverging") else (90, 190, 60)

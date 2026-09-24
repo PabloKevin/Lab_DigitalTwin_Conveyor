@@ -29,19 +29,24 @@ Installing Mosquitto: Windows → installer from mosquitto.org; Ubuntu → `sudo
 
 ## 2. With the real conveyor
 
-1. **ESP32**: open `firmware/esp32_conveyor/esp32_conveyor.ino`, set WiFi + the PC's IP, install *PubSubClient*, flash.
-   It runs the PID locally (like the lab guide) and speaks the protocol below. The motor stops if MQTT is lost for 3 s.
+1. **ESP32** (DevKit V1): open `firmware/esp32_conveyor/esp32_conveyor.ino`, set WiFi + the PC's IP, install *PubSubClient*
+   and *PID* (PID_v1, by Brett Beauregard), flash. It runs the PID locally (like the lab guide) and speaks the protocol
+   below. The motor stops if MQTT is lost for 3 s.
 2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
    `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
    (IP or `esp32cam.local`) and `VISION["mode"] = "yolo"`. If `.local` does not resolve on Ubuntu:
    `sudo apt install avahi-daemon libnss-mdns`, or just use the IP printed on the camera's serial monitor.
-   Frame size must match the calibration and `VISION["imgsz"]`: QVGA 320x240 -> `imgsz=320` (default), VGA -> `imgsz=640`
-   and a ROI of about `(20, 60, 620, 420)`.
+   By default the firmware (`CROP_MIDDLE_THIRD`) captures VGA (640x480) and crops to the middle third vertically before
+   sending, since only the belt band is useful and this cuts WiFi latency a lot — so the frame the PC actually receives
+   is **640x160**. `VISION["imgsz"]` must match: `640` (default). Set `CROP_MIDDLE_THIRD 0` in the firmware to send full,
+   hardware-JPEG-encoded frames instead (less ESP32 CPU, more bytes over WiFi) — then use `imgsz=320`/`640` for QVGA/VGA
+   and re-do the ROI, since the frame height is no longer cropped.
 3. **Geometry**: set `ROLLER_RADIUS_CM` and `MAX_RPM` for *your* drive. With the guide's numbers (r = 5 cm, 300 RPM) the belt runs
    94 cm/s at 100 %, so a 60 cm belt is crossed in under a second. Use the real gear ratio.
 4. **Calibrate the camera**: in *Camera calibration* type the pixel columns where the belt starts (= 0 cm) and ends (= 60 cm) and
-   the top/bottom rows. The video shows the ROI and a ruler every 10 cm; adjust until it matches the belt. Use *Mirror image* if
-   forward moves to the left. Put a ruler or tape marks on the belt to check.
+   the top/bottom rows. The video shows the ROI, a ruler every 10 cm, and a yellow marker at `CALIBRATION_MARK` (a small
+   physical mark measured by hand on the real belt, in `config.py`) — adjust the ROI sliders until that marker lines up
+   with the real mark in the image. Use *Mirror image* if forward moves to the left.
 5. **Objects**: `yolo11n.pt` (COCO) only knows everyday classes. For your own objects, train a model (Ultralytics) and set
    `VISION["model"] = "my_objects.pt"`. Use `VISION["classes"]` to filter.
 
