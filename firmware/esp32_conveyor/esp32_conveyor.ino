@@ -18,9 +18,7 @@
 #include <PubSubClient.h>
 
 // ── network ────────────────────────────────────────────────────────────
-const char* WIFI_SSID = "YOUR_WIFI";
-const char* WIFI_PASS = "YOUR_PASSWORD";
-const char* MQTT_HOST = "192.168.1.10";      // IP of the PC running Mosquitto
+#include "secrets.h"                         // defines WIFI_SSID, WIFI_PASS, MQTT_HOST (copy secrets.h.example, never commit it)
 const uint16_t MQTT_PORT = 1883;
 
 // ── pins ───────────────────────────────────────────────────────────────

@@ -30,8 +30,8 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # ESP32 -> "online" / "offline" 
 # ════════════════════════════════════════════════════════════════════════════
 # Conveyor geometry
 # ════════════════════════════════════════════════════════════════════════════
-BELT_LENGTH_CM = 60.0
-ROLLER_RADIUS_CM = 5.0     # drive roller radius (lab guide: r = 5 cm)
+BELT_LENGTH_CM = 68.0
+ROLLER_RADIUS_CM = 1.30     # drive roller radius (lab guide: r = 5 cm)
 MAX_RPM = 300.0            # RPM at 100 % speed (same mapping as the Arduino code)
 ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 
@@ -48,17 +48,22 @@ STALE_AFTER_S = 2.0        # a value older than this is shown as "—" / conside
 # ════════════════════════════════════════════════════════════════════════════
 VISION = dict(
     mode="yolo",           # "yolo" = real camera + YOLO | "sim" = fake objects (no camera) | "off"
-    camera_url="http://192.168.1.50:81/stream",   # ESP32-CAM MJPEG stream (also accepts a video file or 0 for a webcam)
+    # ESP32-CAM firmware: stream on port 81, settings endpoint /control on port 80 (also accepts a video file or 0 = webcam).
+    # If esp32cam.local does not resolve on Ubuntu use its IP (see the serial monitor) or: sudo apt install avahi-daemon libnss-mdns
+    camera_url="http://esp32cam.local:81/stream",
+    camera_control_url="http://esp32cam.local",
     model="yolo11n.pt",    # any Ultralytics weights; use your own trained .pt for your objects
     conf=0.35,
-    imgsz=640,
+    imgsz=320,             # match the camera frame size: 320 for QVGA, 640 for VGA
     device=None,           # None = auto, "cpu", "cuda:0", "mps"
     classes=None,          # e.g. [39, 41] to keep only some COCO classes; None = all
     tracker="bytetrack.yaml",
     infer_fps=10,          # max inferences per second
-    # Region of the image that contains the belt (x1, y1, x2, y2) in pixels.
+    # Region of the image that contains the belt (x1, y1, x2, y2) in pixels OF THE CAMERA FRAME.
     # x1 -> 0 cm and x2 -> BELT_LENGTH_CM. Tune it live in the "Camera calibration" controls.
-    belt_roi_px=(20, 60, 620, 420),
+    # Defaults are for QVGA 320x240 (FRAMESIZE_QVGA). For VGA 640x480 use about (20, 60, 620, 420).
+    # If you change the frame size in the firmware, re-do the calibration.
+    belt_roi_px=(10, 30, 310, 210),
     flip_x=False,          # True if the camera sees the belt mirrored (forward = towards the left)
     speed_window_s=1.0,    # window used to fit each object's speed
     lost_after_s=1.5,      # forget a track not seen for this long
@@ -104,6 +109,8 @@ VARIABLES = [
     dict(id="cam_belt_speed_cm_s", label="Belt speed (camera)", unit="cm/s", source="vision", fmt="{:.1f}", color="#7a3fb0"),
     dict(id="cam_objects", label="Objects on belt", source="vision", fmt="{:.0f}"),
     dict(id="cam_fps", label="Vision rate", unit="fps", source="vision", fmt="{:.1f}"),
+    dict(id="cam_lag_ms", label="Camera delay (above minimum)", unit="ms", source="vision", fmt="{:.0f}",
+         warn=(None, 300), alarm=(None, 800)),
 ]
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -111,7 +118,7 @@ VARIABLES = [
 # ════════════════════════════════════════════════════════════════════════════
 PANELS = [
     dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "belt_speed_cm_s"]),
-    dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_fps"]),
+    dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_fps", "cam_lag_ms"]),
     dict(title="Twin model", vars=["model_rpm", "model_belt_speed_cm_s"]),
 ]
 
@@ -126,7 +133,8 @@ PLOTS = [
 # ════════════════════════════════════════════════════════════════════════════
 # CONTROLS
 #   kind:    "slider" | "number" | "buttons" | "switch"
-#   target:  "real"  -> publish to MQTT only
+#   target:  "camera" -> HTTP call to the ESP32-CAM /control endpoint (needs camera_var)
+#            "real"  -> publish to MQTT only
 #            "twin"  -> change the digital model / vision parameter only (what-if, calibration, fault injection)
 #            "both"  -> publish to MQTT and change the twin
 #   topic:   MQTT topic to publish to.  payload: optional template, "{value}" is replaced
@@ -163,6 +171,26 @@ CONTROLS = [
          target="twin", model_var="roi_y2"),
     dict(id="flip_x", group="Camera calibration", label="Mirror image", kind="switch", default=VISION["flip_x"],
          target="twin", model_var="flip_x"),
+
+    # ESP32-CAM settings: sent as  http://<camera>/control?var=<camera_var>&val=<int>  (see the camera firmware).
+    # They apply on the camera immediately. The defaults below mirror what the firmware sets at boot.
+    # Moving belt tip: switch "Auto exposure" off and use a short manual exposure to reduce motion blur (add light!).
+    dict(id="cam_quality", group="Camera settings", label="JPEG quality (10 best … 63 smallest)", kind="slider",
+         min=10, max=63, step=1, default=16, target="camera", camera_var="quality"),
+    dict(id="cam_brightness", group="Camera settings", label="Brightness", kind="slider",
+         min=-2, max=2, step=1, default=1, target="camera", camera_var="brightness"),
+    dict(id="cam_contrast", group="Camera settings", label="Contrast", kind="slider",
+         min=-2, max=2, step=1, default=0, target="camera", camera_var="contrast"),
+    dict(id="cam_saturation", group="Camera settings", label="Saturation", kind="slider",
+         min=-2, max=2, step=1, default=-2, target="camera", camera_var="saturation"),
+    dict(id="cam_autoexp", group="Camera settings", label="Auto exposure", kind="switch", default=True,
+         target="camera", camera_var="exposure_ctrl"),
+    dict(id="cam_exposure", group="Camera settings", label="Manual exposure (0 … 1200)", kind="slider",
+         min=0, max=1200, step=10, default=300, target="camera", camera_var="aec_value"),
+    dict(id="cam_autogain", group="Camera settings", label="Auto gain", kind="switch", default=True,
+         target="camera", camera_var="gain_ctrl"),
+    dict(id="cam_gain", group="Camera settings", label="Manual gain (0 … 30)", kind="slider",
+         min=0, max=30, step=1, default=0, target="camera", camera_var="agc_gain"),
 
     # EXAMPLE of a switch that talks to the real conveyor with a JSON payload:
     # dict(id="pid_on", group="PID gains", label="PID enabled", kind="switch", default=True,

@@ -92,6 +92,7 @@ body {
 .tag { font-size: 11px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
 .tag.both { color: var(--cobalt); border-color: #a9c1e8; }
 .tag.twin { color: var(--amber); border-color: #ecd09b; }
+.tag.camera { color: var(--purple); border-color: #cdb6e6; }
 .tag.real { color: var(--cobalt); border-color: #a9c1e8; }
 .num { width: 120px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; font: inherit; background: #fff; }
 .sw label { cursor: pointer; }

@@ -63,6 +63,7 @@ def _loop():
         sp = state.get("belt_speed_cm_s")
         if sp is not None:
             state.travel_real += sp * dt
+        state.travel_hist.append((now, state.travel_real))
         divergence.evaluate()
         time.sleep(0.05)
 

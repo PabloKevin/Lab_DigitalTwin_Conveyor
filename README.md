@@ -31,8 +31,12 @@ Installing Mosquitto: Windows → installer from mosquitto.org; Ubuntu → `sudo
 
 1. **ESP32**: open `firmware/esp32_conveyor/esp32_conveyor.ino`, set WiFi + the PC's IP, install *PubSubClient*, flash.
    It runs the PID locally (like the lab guide) and speaks the protocol below. The motor stops if MQTT is lost for 3 s.
-2. **Camera**: flash the *CameraWebServer* example on the ESP32-CAM (VGA or QVGA is enough), open `http://<ip>` once to check it,
-   then set `VISION["camera_url"] = "http://<ip>:81/stream"` and `VISION["mode"] = "yolo"`.
+2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
+   `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
+   (IP or `esp32cam.local`) and `VISION["mode"] = "yolo"`. If `.local` does not resolve on Ubuntu:
+   `sudo apt install avahi-daemon libnss-mdns`, or just use the IP printed on the camera's serial monitor.
+   Frame size must match the calibration and `VISION["imgsz"]`: QVGA 320x240 -> `imgsz=320` (default), VGA -> `imgsz=640`
+   and a ROI of about `(20, 60, 620, 420)`.
 3. **Geometry**: set `ROLLER_RADIUS_CM` and `MAX_RPM` for *your* drive. With the guide's numbers (r = 5 cm, 300 RPM) the belt runs
    94 cm/s at 100 %, so a 60 cm belt is crossed in under a second. Use the real gear ratio.
 4. **Calibrate the camera**: in *Camera calibration* type the pixel columns where the belt starts (= 0 cm) and ends (= 60 cm) and
@@ -74,6 +78,10 @@ dict(id="pid_on", group="PID gains", label="PID enabled", kind="switch", default
 `kind`: `slider`, `number`, `buttons`, `switch`. `target`: `"real"` (publish), `"twin"` (only changes the model), `"both"`.
 A control with `model_var="x"` writes `state.params["x"]`, which `twin_model.step_model()` and `vision.py` can read.
 
+**Camera settings from the page**: the *Camera settings* controls (`target="camera"`) call your firmware's `/control?var=..&val=..`
+(quality, brightness, contrast, saturation, exposure, gain). For a moving belt, turn *Auto exposure* off and use a short manual
+exposure with more light to reduce motion blur. Add another with `camera_var="..."` for any variable your firmware handles.
+
 **Change the twin physics**: edit `step_model()` in `twin_model.py` (currently a first-order lag, `MODEL["tau_s"]`). Add new
 model outputs with `state.set_value("model_xyz", …)` and declare them as `source="model"` variables.
 
@@ -105,10 +113,14 @@ New kinds go in `divergence._check()`.
 | `controls.py` | what happens when a widget changes |
 | `state.py` | shared thread-safe state |
 | `sim_esp32.py` | fake ESP32 for testing |
-| `firmware/esp32_conveyor/` | ESP32 sketch |
+| `firmware/esp32_conveyor/` | ESP32 controller sketch (PID + MQTT) |
+| `firmware/esp32_cam/` | notes for the ESP32-CAM sketch and `secrets.h` template |
 
 ## 7. Known limitations
 
-* Frame timestamps are the PC's arrival time, so WiFi/stream latency (typically 100–300 ms) is not compensated. It shows up as a small constant position offset.
+* Camera timing: the ESP32-CAM stamps every frame (`X-Timestamp`, time since boot). `vision.py` maps it to PC time using the
+  least-delayed frames (`ClockSync`) and compares each frame with the encoder travel *at that moment*, so WiFi jitter does not
+  create false divergences. The remaining constant delay (transport minimum) is not compensated; `Camera delay` shows the
+  jitter on top of it. Timestamps are only used with the HTTP stream; videos/webcams use the PC clock.
 * Object speed comes from tracking the object's centre over ~1 s; very fast belts or low `infer_fps` make it noisy.
 * Run `python app.py` (not with Flask's reloader): the reloader would start every thread and MQTT client twice.

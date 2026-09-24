@@ -16,12 +16,14 @@ Both modes feed the same pipeline (VisionBase.process), which
 To add a new kind of measurement, edit VisionBase.process().
 """
 import json
+import re
 import threading
 import time
 from collections import deque
 
 import cv2
 import numpy as np
+import requests
 
 import config as cfg
 from state import state
@@ -84,7 +86,7 @@ class TrackBook:
         self.tracks = {}
 
     def update(self, dets, t):
-        travel = state.travel_real
+        travel = state.travel_at(t)          # encoder travel at the moment the frame was captured
         for d in dets:
             tr = self.tracks.get(d["tid"])
             if tr is None:
@@ -140,6 +142,7 @@ class VisionBase(threading.Thread):
         if speeds:
             state.set_value("cam_belt_speed_cm_s", float(np.median(speeds)))
 
+        state.set_value("cam_lag_ms", max(0.0, (time.time() - t) * 1000.0))
         self._stamps.append(t)
         if len(self._stamps) >= 2 and self._stamps[-1] > self._stamps[0]:
             state.set_value("cam_fps", (len(self._stamps) - 1) / (self._stamps[-1] - self._stamps[0]))
@@ -162,28 +165,91 @@ class VisionBase(threading.Thread):
 
 
 # ── real camera + YOLO ─────────────────────────────────────────────────────────────────
+def mjpeg_frames(resp):
+    """Parse a multipart/x-mixed-replace stream by hand so the per-frame X-Timestamp header is available.
+    Yields (jpeg_bytes, camera_timestamp_seconds_or_None)."""
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=2048):   # small: must not wait to fill a big buffer
+        buf += chunk
+        while True:
+            h = buf.find(b"\r\n\r\n")
+            if h < 0:
+                break
+            head = bytes(buf[:h]).decode("latin-1")
+            m = re.search(r"Content-Length:\s*(\d+)", head, re.I)
+            if not m:
+                del buf[:h + 4]
+                continue
+            n = int(m.group(1))
+            if len(buf) < h + 4 + n:
+                break                                   # frame not complete yet
+            jpg = bytes(buf[h + 4:h + 4 + n])
+            del buf[:h + 4 + n]
+            ts = re.search(r"X-Timestamp:\s*([\d.]+)", head, re.I)
+            yield jpg, (float(ts.group(1)) if ts else None)
+
+
+class ClockSync:
+    """Maps the ESP32-CAM clock to the PC clock.
+    The camera timestamp is only meaningful as a difference (time since boot), so we estimate the offset as the
+    smallest (arrival - camera_ts) seen recently, i.e. the frames with the least network delay.
+    Result: frame times without WiFi jitter, at the moment of capture (+ the minimum transport delay)."""
+
+    def __init__(self):
+        self.samples = deque(maxlen=300)
+        self.last_ts = None
+
+    def to_pc(self, ts_cam, arrival):
+        if self.last_ts is not None and ts_cam < self.last_ts - 1.0:      # camera rebooted -> new timebase
+            self.samples.clear()
+        self.last_ts = ts_cam
+        self.samples.append(arrival - ts_cam)
+        return ts_cam + min(self.samples)
+
+
 class CameraReader(threading.Thread):
-    """Always keeps only the newest frame so slow inference never adds latency."""
+    """Keeps only the newest frame so slow inference never adds latency.
+    http(s) URLs use the hand-written MJPEG parser (uses X-Timestamp); anything else (file, 0 = webcam) uses OpenCV."""
 
     def __init__(self, url):
         super().__init__(daemon=True, name="camera-reader")
         self.url = int(url) if str(url).isdigit() else url
         self.frame, self.t, self.seq = None, 0.0, 0
 
+    def _push(self, frame, t):
+        self.frame, self.t, self.seq = frame, t, self.seq + 1
+
     def run(self):
+        http = isinstance(self.url, str) and self.url.startswith("http")
         while True:
-            cap = cv2.VideoCapture(self.url)
-            if not cap.isOpened():
-                state.vision_status = f"cannot open {self.url}"
-                time.sleep(2)
-                continue
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                self.frame, self.t, self.seq = frame, time.time(), self.seq + 1
-            cap.release()
-            time.sleep(1)
+            try:
+                self._run_http() if http else self._run_cv()
+            except Exception as e:
+                state.vision_status = f"camera error: {type(e).__name__}"
+            time.sleep(1.5)
+
+    def _run_http(self):
+        sync = ClockSync()
+        with requests.get(self.url, stream=True, timeout=(4, 5)) as resp:
+            resp.raise_for_status()
+            for jpg, ts in mjpeg_frames(resp):
+                arrival = time.time()
+                frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+                if frame is None:                       # ESP32-CAM sometimes sends a damaged JPEG
+                    continue
+                self._push(frame, sync.to_pc(ts, arrival) if ts is not None else arrival)
+
+    def _run_cv(self):
+        cap = cv2.VideoCapture(self.url)
+        if not cap.isOpened():
+            state.vision_status = f"cannot open {self.url}"
+            return
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            self._push(frame, time.time())
+        cap.release()
 
 
 class YoloVision(VisionBase):
@@ -213,8 +279,8 @@ class YoloVision(VisionBase):
             last_frame_t = time.time()
             state.vision_status = "streaming"
 
-            if t - last_inf >= 1.0 / V["infer_fps"]:
-                last_inf = t
+            if time.time() - last_inf >= 1.0 / V["infer_fps"]:
+                last_inf = time.time()
                 res = model.track(frame, persist=True, tracker=V["tracker"], conf=V["conf"], imgsz=V["imgsz"],
                                   classes=V["classes"], device=V["device"], verbose=False)[0]
                 objs = self.process(self._detections(res, model.names), t)

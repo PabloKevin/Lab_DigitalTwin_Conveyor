@@ -281,7 +281,7 @@ def controls_block():
     groups = {}
     for c in cfg.CONTROLS:
         groups.setdefault(c.get("group", "Controls"), []).append(c)
-    tags = {"real": "real", "twin": "twin only", "both": "real + twin"}
+    tags = {"real": "real", "twin": "twin only", "both": "real + twin", "camera": "ESP32-CAM"}
     out = []
     for g, items in groups.items():
         rows = []

@@ -5,6 +5,7 @@ state.py - the single shared object that every module reads/writes (thread-safe)
     state.set_value("rpm", 120.0)
     state.get("rpm")            # latest value, or None if older than STALE_AFTER_S
 """
+import bisect
 import threading
 import time
 from collections import deque
@@ -43,6 +44,7 @@ class TwinState:
         self.model = {"rpm": 0.0}
         self.travel_real = 0.0                 # cm, integrated from encoder speed
         self.travel_model = 0.0                # cm, integrated from model speed
+        self.travel_hist = deque(maxlen=1200)  # (time, travel_real) so camera frames can be compared at THEIR capture time
         self.objects = []                      # list of dicts published by vision.py
         self.jpeg = None                       # last annotated camera frame (bytes)
 
@@ -85,6 +87,20 @@ class TwinState:
     def series(self, vid):
         with self.lock:
             return list(self.history.get(vid, []))
+
+    def travel_at(self, t):
+        """Encoder travel (cm) interpolated at time t (camera frames are older than 'now')."""
+        h = list(self.travel_hist)
+        if not h:
+            return self.travel_real
+        ts = [p[0] for p in h]
+        if t >= ts[-1]:
+            return h[-1][1]
+        if t <= ts[0]:
+            return h[0][1]
+        i = bisect.bisect_left(ts, t)
+        (t0, x0), (t1, x1) = h[i - 1], h[i]
+        return x0 + (x1 - x0) * (t - t0) / max(1e-9, t1 - t0)
 
     # ── events ─────────────────────────────────────────────────────────────
     def log(self, msg, level="info"):

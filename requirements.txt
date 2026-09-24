@@ -5,3 +5,4 @@ numpy
 opencv-python
 # Only needed when config.VISION["mode"] == "yolo" (pulls in PyTorch, ~1-2 GB):
 ultralytics>=8.3
+requests>=2.28

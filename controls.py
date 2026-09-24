@@ -2,6 +2,10 @@
 controls.py - conversion helpers + the logic executed when a control changes.
 Adding a control only requires editing config.CONTROLS; this file rarely changes.
 """
+import threading
+
+import requests
+
 import config as cfg
 from state import state
 
@@ -51,6 +55,16 @@ def payload_text(c, typed):
     return c.get("payload", "{value}").replace("{value}", txt), txt
 
 
+def _camera_set(var, val, label):
+    url = cfg.VISION["camera_control_url"].rstrip("/") + "/control"
+    try:
+        r = requests.get(url, params={"var": var, "val": val}, timeout=3)
+        if r.status_code != 200:
+            state.log(f"ESP32-CAM refused {var}={val} (HTTP {r.status_code})", "warn")
+    except requests.RequestException as e:
+        state.log(f"ESP32-CAM not reachable for {label}: {type(e).__name__}", "warn")
+
+
 def apply(c, typed, bridge, force=False):
     """Store the value, update the twin parameter and (if configured + Live sync) publish to MQTT.
     force=True publishes even in Sandbox mode (used by the E-stop)."""
@@ -61,6 +75,10 @@ def apply(c, typed, bridge, force=False):
     payload, txt = payload_text(c, typed)
     target = c.get("target", "real")
     where = []
+    if target == "camera":                       # HTTP call to the ESP32-CAM, done in a thread so the UI never blocks
+        val = int(typed)                         # bool -> 0/1, slider float -> int
+        threading.Thread(target=_camera_set, args=(c["camera_var"], val, c["label"]), daemon=True).start()
+        where.append("camera")
     if target in ("twin", "both"):
         where.append("twin")
     if target in ("real", "both") and c.get("topic"):
