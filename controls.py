@@ -66,7 +66,7 @@ def _camera_set(var, val, label):
 
 
 def apply(c, typed, bridge, force=False):
-    """Store the value, update the twin parameter and (if configured + Live sync) publish to MQTT.
+    """Store the value, update the twin parameter and (if configured + Live sync) send it to the conveyor (bridge.publish).
     force=True publishes even in Sandbox mode (used by the E-stop)."""
     state.controls[c["id"]] = typed
     if c.get("model_var"):
@@ -86,7 +86,7 @@ def apply(c, typed, bridge, force=False):
             if bridge.publish(c["topic"], payload, retain=c.get("retain", False)):
                 where.append("real")
             else:
-                where.append("real: NOT SENT (no broker)")
+                where.append("real: NOT SENT (no link)")
         else:
             where.append("real: not sent (sandbox)")
     state.last_command = f"{c['label']} = {txt}  →  {', '.join(where)}"

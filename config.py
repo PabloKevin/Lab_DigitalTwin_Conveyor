@@ -1,19 +1,23 @@
 """
 config.py  -  EVERYTHING you normally want to edit lives in this file.
 
-  * VARIABLES         what data exists (from MQTT, derived, model or camera)
+  * VARIABLES         what data exists (from the serial link, derived, model or camera)
   * PANELS            which variables are shown in which window
   * PLOTS             which variables are drawn in which time-series chart
   * CONTROLS          widgets that change the digital twin and/or the real conveyor
   * DIVERGENCE_RULES  how physical vs digital mismatches are detected
 
 To add a sensor:   1) add a dict to VARIABLES   2) (optional) add its id to a PANELS / PLOTS entry
-To add a control:  add a dict to CONTROLS  (it publishes to MQTT and/or changes the twin model)
+To add a control:  add a dict to CONTROLS  (it sends a command to the conveyor and/or changes the twin model)
 """
 import math
 
 # ════════════════════════════════════════════════════════════════════════════
 # MQTT
+#   Only used for the camera/vision pipeline now (vision.py publishes detected objects to
+#   VISION["publish_topic"]). The conveyor (motor + encoder) talks over USB serial instead -
+#   see SERIAL below - because the ESP32's H-bridge wiring wasn't driving the motor reliably,
+#   so the conveyor controller moved back to an Arduino UNO (firmware/arduino_uno_conveyor/).
 # ════════════════════════════════════════════════════════════════════════════
 MQTT = dict(
     host="localhost",          # Mosquitto running on this PC
@@ -24,8 +28,26 @@ MQTT = dict(
     keepalive=30,
 )
 TOPIC_PREFIX = "conveyor"
-TOPIC_TELEMETRY = f"{TOPIC_PREFIX}/telemetry"   # ESP32 -> JSON {"rpm":..,"setpoint":..,"output":..,"dir":"F"}
-STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # ESP32 -> "online" / "offline" (Last Will)
+# TOPIC_TELEMETRY / STATUS_TOPIC are no longer real MQTT topics - serial_bridge.py reuses these
+# strings as internal keys so VARIABLES (below) and the "cmd/..." control topics don't need to change.
+TOPIC_TELEMETRY = f"{TOPIC_PREFIX}/telemetry"   # Arduino -> JSON {"rpm":..,"setpoint":..,"output":..,"dir":"F"}
+STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equivalent to the MQTT Last Will)
+
+# ════════════════════════════════════════════════════════════════════════════
+# Serial (Arduino UNO conveyor controller)
+#   Protocol (must match firmware/arduino_uno_conveyor/arduino_uno_conveyor.ino):
+#     Arduino -> PC   one JSON line every 100 ms, same fields as the old MQTT telemetry payload
+#     PC -> Arduino   one line per command: F | R | S   (direction)
+#                     V<0..100>                          (speed, % of MAX_RPM)
+#                     P<float> | I<float> | D<float>     (Kp / Ki / Kd)
+# ════════════════════════════════════════════════════════════════════════════
+SERIAL = dict(
+    port="auto",        # "auto" = pick the first port that looks like an Arduino; or e.g. "/dev/ttyACM0"
+    baud=115200,
+    reconnect_s=2.0,
+    heartbeat_s=1.0,     # re-send the last direction command this often, so the Arduino's link-loss
+                         # failsafe (FAILSAFE_MS) sees traffic even when nothing has changed
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 # Conveyor geometry
@@ -87,24 +109,28 @@ VISION = dict(
 
 # ════════════════════════════════════════════════════════════════════════════
 # VARIABLES
-#   source="mqtt"     read from an MQTT topic (topic + key). key=None -> scalar payload
+#   source="serial"   read from the Arduino UNO telemetry line (topic + key, see serial_bridge.py).
+#                     key=None -> scalar payload. "topic" here is just a dispatch key, not a real MQTT topic.
 #   source="derived"  computed here: fn(values_dict) -> value
 #   source="model"    written by twin_model.py
 #   source="vision"   written by vision.py
 #   Optional: unit, fmt, color (plot line), warn=(lo,hi), alarm=(lo,hi)  (None = no limit), hidden=True
 # ════════════════════════════════════════════════════════════════════════════
 VARIABLES = [
-    # --- from the ESP32 --------------------------------------------------
-    dict(id="rpm", label="Motor speed", unit="RPM", source="mqtt", topic=TOPIC_TELEMETRY, key="rpm", fmt="{:.0f}", color="#1f5fbf"),
-    dict(id="setpoint", label="PID setpoint", unit="RPM", source="mqtt", topic=TOPIC_TELEMETRY, key="setpoint", fmt="{:.0f}", color="#8a97a8"),
-    dict(id="pwm", label="PWM output", unit="/255", source="mqtt", topic=TOPIC_TELEMETRY, key="output", fmt="{:.0f}",
+    # --- from the Arduino UNO (firmware/arduino_uno_conveyor/), over serial -----------------
+    dict(id="rpm", label="Motor speed", unit="RPM", source="serial", topic=TOPIC_TELEMETRY, key="rpm", fmt="{:.0f}", color="#1f5fbf"),
+    dict(id="setpoint", label="PID setpoint", unit="RPM", source="serial", topic=TOPIC_TELEMETRY, key="setpoint", fmt="{:.0f}", color="#8a97a8"),
+    dict(id="pwm", label="PWM output", unit="/255", source="serial", topic=TOPIC_TELEMETRY, key="output", fmt="{:.0f}",
          warn=(None, 230), alarm=(None, 250)),
-    dict(id="direction", label="Direction", source="mqtt", topic=TOPIC_TELEMETRY, key="dir"),
+    dict(id="direction", label="Direction", source="serial", topic=TOPIC_TELEMETRY, key="dir"),
+    # HC-SR04 wired to the Arduino (optional, see the firmware's ULTRASONIC flag) - independent of the camera:
+    dict(id="us_distance_cm", label="Distance (ultrasonic)", unit="cm", source="serial", topic=TOPIC_TELEMETRY,
+         key="distance_cm", fmt="{:.1f}"),
+    dict(id="us_obj_speed_cm_s", label="Object speed (ultrasonic)", unit="cm/s", source="serial", topic=TOPIC_TELEMETRY,
+         key="obj_speed_cm_s", fmt="{:.1f}"),
     # EXAMPLE - uncomment to add a motor current sensor (ACS712) in 2 minutes:
-    # dict(id="current", label="Motor current", unit="A", source="mqtt", topic=TOPIC_TELEMETRY, key="current",
+    # dict(id="current", label="Motor current", unit="A", source="serial", topic=TOPIC_TELEMETRY, key="current",
     #      fmt="{:.2f}", warn=(None, 1.5), alarm=(None, 2.5)),
-    # A sensor on its own topic (scalar payload) works too:
-    # dict(id="temp", label="Motor temp", unit="°C", source="mqtt", topic=f"{TOPIC_PREFIX}/telemetry/temp", key=None),
 
     # --- derived from other variables -------------------------------------
     # v is a dict {id: value} with the fresh values. If a key is missing the variable is skipped.
@@ -145,10 +171,11 @@ PLOTS = [
 # CONTROLS
 #   kind:    "slider" | "number" | "buttons" | "switch"
 #   target:  "camera" -> HTTP call to the ESP32-CAM /control endpoint (needs camera_var)
-#            "real"  -> publish to MQTT only
+#            "real"  -> sent to the conveyor (over serial, via serial_bridge.py) only
 #            "twin"  -> change the digital model / vision parameter only (what-if, calibration, fault injection)
-#            "both"  -> publish to MQTT and change the twin
-#   topic:   MQTT topic to publish to.  payload: optional template, "{value}" is replaced
+#            "both"  -> sent to the conveyor and changes the twin
+#   topic:   "conveyor/cmd/<key>" - serial_bridge.py maps <key> to a one-letter serial command (see README §3).
+#            payload: optional template, "{value}" is replaced
 #   model_var: name of the twin parameter this control writes (state.params[model_var])
 # ════════════════════════════════════════════════════════════════════════════
 _R = VISION["belt_roi_px"]
@@ -241,5 +268,5 @@ DIVERGENCE_RULES = [
          abs_tol=4.0, hold_s=0.5, unit="cm",
          cause="Object sliding on the belt", action="Check the belt surface, recalibrate the camera"),
     dict(id="link", kind="stale", label="Telemetry link", var="rpm", max_age_s=2.0, unit="s",
-         cause="WiFi / MQTT latency or loss", action="Check WiFi signal, reduce message size"),
+         cause="USB serial link lost or Arduino reset", action="Check the USB cable/port, reflash if needed"),
 ]

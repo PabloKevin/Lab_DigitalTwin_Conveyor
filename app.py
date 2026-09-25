@@ -17,11 +17,13 @@ import controls
 import twin_model
 import vision
 from mqtt_bridge import MqttBridge
+from serial_bridge import SerialBridge
 from state import is_num, state
 
 L = cfg.BELT_LENGTH_CM
 VAR = {v["id"]: v for v in cfg.VARIABLES}
-bridge = MqttBridge()
+bridge = SerialBridge()        # conveyor (motor + encoder): Arduino UNO over USB serial
+mqtt = MqttBridge()            # camera/vision only: vision.py publishes detections here
 
 app = Dash(__name__, title="Conveyor digital twin", update_title=None)
 server = app.server
@@ -155,15 +157,15 @@ def monitor_view():
 def badges_view():
     a = state.age("rpm")
     if not state.mqtt_connected:
-        mq = badge("MQTT", "broker unreachable", "alarm")
+        mq = badge("MQTT (camera)", "broker unreachable", "alarm")
     else:
-        mq = badge("MQTT", f"{cfg.MQTT['host']}", "ok")
+        mq = badge("MQTT (camera)", f"{cfg.MQTT['host']}", "ok")
     if a is not None and a < cfg.STALE_AFTER_S:
-        dev = badge("ESP32", f"live · {a:.1f} s ago", "ok")
+        dev = badge("Conveyor", f"live · {a:.1f} s ago", "ok")
     elif state.device_status == "online":
-        dev = badge("ESP32", "online, no telemetry", "warn")
+        dev = badge("Conveyor", "online, no telemetry", "warn")
     else:
-        dev = badge("ESP32", "no data", "alarm")
+        dev = badge("Conveyor", "no data", "alarm")
     vs = state.vision_status
     cam = badge("Camera", vs, "ok" if vs in ("streaming", "simulated") else ("na" if vs == "off" else "warn"))
     return [mq, dev, cam]
@@ -298,7 +300,7 @@ def serve_layout():
     return html.Div(className="app", children=[
         html.Header(className="top", children=[
             html.Div(children=[html.H1("Conveyor digital twin"),
-                               html.P(f"{L:g} cm belt · ESP32 over MQTT · camera + YOLO", className="sub")]),
+                               html.P(f"{L:g} cm belt · Arduino over serial · camera + YOLO", className="sub")]),
             html.Div(id="badges", className="badges"),
             html.Div(className="actions", children=[
                 dcc.RadioItems(id="sync", value="live" if state.sync else "sandbox", className="seg", labelClassName="seg-l",
@@ -323,7 +325,7 @@ def serve_layout():
             dcc.Graph(id={"type": "plot", "id": p["id"]}, config={"displayModeBar": False}) for p in cfg.PLOTS]),
         html.Section(className="logs", children=[
             card("Events", html.Div(id="events")),
-            card("MQTT monitor", html.Div(id="monitor")),
+            card("Comm monitor", html.Div(id="monitor")),
         ]),
         dcc.Interval(id="fast", interval=250),
         dcc.Interval(id="slow", interval=500),
@@ -387,8 +389,9 @@ def refresh_plots(_):
 # ════════════════════════════════════════════════════════════════════════════
 def main():
     bridge.start()
+    mqtt.start()
     twin_model.start()
-    vision.start(bridge)
+    vision.start(mqtt)
     url = f"http://{cfg.WEB['host']}:{cfg.WEB['port']}"
     print(f"\n  Digital twin running at {url}\n")
     if cfg.WEB.get("open_browser"):

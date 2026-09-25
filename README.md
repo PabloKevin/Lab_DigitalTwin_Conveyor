@@ -1,37 +1,51 @@
-# Conveyor digital twin (ESP32 · MQTT · camera + YOLO · Dash)
+# Conveyor digital twin (Arduino UNO · pyserial · ESP32-CAM · MQTT · camera + YOLO · Dash)
 
 A local web page that mirrors a 60 cm conveyor in real time, lets you change the real machine and the
 digital model from the same screen, and flags when physical and digital behaviour diverge.
 
 ```
- ESP32 (PID, encoder, L298N) ──MQTT──►  Mosquitto  ◄──MQTT──  app.py  ◄── browser (localhost:8050)
- ESP32-CAM ────── HTTP MJPEG stream ──────────────────────►  vision.py (YOLO + tracking)
+ Arduino UNO (PID, encoder, XY-15AS) ──USB serial──►  app.py  ◄── browser (localhost:8050)
+ ESP32-CAM ────────── HTTP MJPEG stream ─────────────►  vision.py (YOLO + tracking) ──MQTT──► Mosquitto (optional, outbound only)
 ```
+
+The conveyor (motor + encoder + PID) is driven by an Arduino UNO over a direct USB-serial link
+(`serial_bridge.py`) - an ESP32 was tried first but its H-bridge wiring didn't drive the motor
+reliably, see `firmware/esp32_conveyor/` if you want to revisit that path. The camera is unrelated
+to this and still an ESP32-CAM talking plain HTTP; MQTT/Mosquitto is now only used one-way, for
+`vision.py` to broadcast detected objects (nothing in this app reads that topic back).
 
 ## 1. Try it without hardware (5 minutes)
 
 ```bash
 pip install -r requirements.txt        # ultralytics is only needed for real YOLO vision
-mosquitto -c mosquitto.conf -v         # terminal 1  (install Mosquitto first, see below)
-python sim_esp32.py                    # terminal 2  fake conveyor
-# in config.py set VISION["mode"] = "sim"   (fake objects riding the belt)
-python app.py                          # terminal 3  opens http://127.0.0.1:8050
+python sim_conveyor.py                 # terminal 1  fake conveyor over a virtual serial port
+# it prints a path like /dev/pts/4 - copy it into config.py's SERIAL["port"] (replacing "auto")
+# in config.py also set VISION["mode"] = "sim"   (fake objects riding the belt)
+python app.py                          # terminal 2  opens http://127.0.0.1:8050
 ```
 
 In the page: set **Direction = Forward** and **Speed = 10 %**. Then try
 * *Twin what-if → Inject speed loss* (twin only): the model slows down, the **Motor speed vs model** rule fires.
-* `python sim_esp32.py --loss 25`: the *real* conveyor loses speed instead. Same alert, opposite cause.
+* `python sim_conveyor.py --loss 25`: the *real* conveyor loses speed instead. Same alert, opposite cause.
 * `VISION["sim_slip"] = 0.7` in `config.py`: objects slip on the belt, **belt slip** and **object position** rules fire.
 * **Sandbox** (top right): commands no longer go to the machine, you only play with the twin. **E-stop** always sends *Stop*.
 
-Installing Mosquitto: Windows → installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-clients`; macOS → `brew install mosquitto`.
+`sim_conveyor.py` uses a Unix pty pair, so it only runs on Linux/macOS; on Windows use WSL, or wire up a
+real Arduino. `sim_conveyor.py` picks a new pty path every run - re-copy it into `config.py` each time.
+
+Mosquitto is optional (only needed if you want `vision.py`'s object broadcasts to go somewhere): Windows →
+installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-clients`; macOS → `brew install mosquitto`.
 `mosquitto.conf` opens port 1883 to the LAN without passwords: fine for a lab, not for the internet.
 
 ## 2. With the real conveyor
 
-1. **ESP32** (DevKit V1): open `firmware/esp32_conveyor/esp32_conveyor.ino`, set WiFi + the PC's IP, install *PubSubClient*
-   and *PID* (PID_v1, by Brett Beauregard), flash. It runs the PID locally (like the lab guide) and speaks the protocol
-   below. The motor stops if MQTT is lost for 3 s.
+1. **Arduino UNO**: open `firmware/arduino_uno_conveyor/arduino_uno_conveyor.ino`, install the *PID* library
+   (PID_v1, by Brett Beauregard), flash. It runs the PID locally and speaks the serial protocol below.
+   Plug it into the PC via USB, then in `config.py` set `SERIAL["port"]` - leave it `"auto"` to let
+   `serial_bridge.py` pick the first port that looks like an Arduino, or set it explicitly (check with
+   `ls /dev/tty*` before/after plugging it in - usually `/dev/ttyACM0` or `/dev/ttyUSB0` on Linux). The
+   motor stops if no command arrives for 3 s (`app.py` re-sends the current direction every second as a
+   heartbeat even when unchanged, so a genuinely lost USB link is what trips this, not an idle UI).
 2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
    `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
    (IP or `esp32cam.local`) and `VISION["mode"] = "yolo"`. If `.local` does not resolve on Ubuntu:
@@ -50,38 +64,48 @@ Installing Mosquitto: Windows → installer from mosquitto.org; Ubuntu → `sudo
 5. **Objects**: `yolo11n.pt` (COCO) only knows everyday classes. For your own objects, train a model (Ultralytics) and set
    `VISION["model"] = "my_objects.pt"`. Use `VISION["classes"]` to filter.
 
-## 3. MQTT protocol
+## 3. Serial protocol (conveyor) and MQTT (camera only)
+
+| Line | Direction | Payload |
+|---|---|---|
+| telemetry | Arduino → PC | `{"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","distance_cm":58.5,"obj_speed_cm_s":0.0}` (10 Hz, rpm is signed; the `distance_cm`/`obj_speed_cm_s` fields need the optional HC-SR04, see the firmware's `ULTRASONIC` flag) |
+| direction | PC → Arduino | `F`, `R` or `S` |
+| speed | PC → Arduino | `V0`–`V100` (% of `MAX_RPM`) |
+| PID gains | PC → Arduino | `P<float>`, `I<float>`, `D<float>` |
+
+`config.py`'s `CONTROLS` still declare MQTT-style topics (`conveyor/cmd/direction`, etc.) - `serial_bridge.py`
+translates those into the lines above, so you don't touch `config.py`/`controls.py` to work with the new transport.
 
 | Topic | Direction | Payload |
 |---|---|---|
-| `conveyor/telemetry` | ESP32 → PC | `{"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F"}` (10 Hz, rpm is signed) |
-| `conveyor/status` | ESP32 → PC | `online` / `offline` (retained + Last Will) |
-| `conveyor/cmd/direction` | PC → ESP32 | `F`, `R` or `S` |
-| `conveyor/cmd/speed` | PC → ESP32 | `0`–`100` (% of `MAX_RPM`) |
-| `conveyor/cmd/kp` `ki` `kd` | PC → ESP32 | number |
-| `conveyor/vision/objects` | PC → anyone | `{"ts":…, "belt_speed_cm_s":…, "objects":[{"id":1,"label":"box","x_cm":23.4,"speed_cm_s":15.8}]}` |
+| `conveyor/vision/objects` | PC → anyone (MQTT) | `{"ts":…, "belt_speed_cm_s":…, "objects":[{"id":1,"label":"box","x_cm":23.4,"speed_cm_s":15.8}]}` |
 
-Everything under `conveyor/#` appears in the **MQTT monitor** at the bottom of the page, handy for debugging.
+The last raw telemetry line and any MQTT traffic under `conveyor/#` both appear in the **Comm monitor** at the
+bottom of the page, handy for debugging either link.
 
 ## 4. Customising (all in `config.py`)
 
-**Add a sensor** (e.g. motor current sent by the ESP32 as `"current"` in the telemetry JSON):
+**Add a sensor** (e.g. motor current, added to the Arduino's telemetry JSON as `"current"`):
 ```python
-dict(id="current", label="Motor current", unit="A", source="mqtt", topic=TOPIC_TELEMETRY, key="current",
+dict(id="current", label="Motor current", unit="A", source="serial", topic=TOPIC_TELEMETRY, key="current",
      fmt="{:.2f}", warn=(None, 1.5), alarm=(None, 2.5)),
 ```
 Then put `"current"` in a `PANELS` entry (a window) and/or a `PLOTS` entry (a chart). Variables not placed anywhere land in an "Other" window.
-A sensor on its own topic with a plain number payload: `topic="conveyor/temp", key=None`.
+Since the Arduino only sends one JSON line, add the field there too (see how `distance_cm`/`obj_speed_cm_s` are added in `arduino_uno_conveyor.ino`) - `key` just picks it out of that same line.
 
 **Add a computed value**: `source="derived"` with `fn=lambda v: v["current"] * 12` (watts). It is skipped while an input is missing.
 
 **Add a control** that changes the real conveyor:
 ```python
-dict(id="pid_on", group="PID gains", label="PID enabled", kind="switch", default=True,
-     target="real", topic="conveyor/cmd/pid", payload='{"enabled": {value}}'),
+dict(id="accel_limit", group="PID gains", label="Accel limit", kind="number", default=50,
+     target="real", topic="conveyor/cmd/accel"),
 ```
-`kind`: `slider`, `number`, `buttons`, `switch`. `target`: `"real"` (publish), `"twin"` (only changes the model), `"both"`.
+`kind`: `slider`, `number`, `buttons`, `switch`. `target`: `"real"` (sent to the Arduino), `"twin"` (only changes the model), `"both"`.
 A control with `model_var="x"` writes `state.params["x"]`, which `twin_model.step_model()` and `vision.py` can read.
+For `target="real"`/`"both"`, `topic` must be `conveyor/cmd/<key>` - `serial_bridge.py`'s `publish()` maps `<key>` to a
+one-letter serial command (`direction`→as-is, `speed`→`V`, `kp`/`ki`/`kd`→`P`/`I`/`D`); add a new `<key>` case there
+**and** a matching `case` in the Arduino's command switch if you add a control the firmware doesn't already understand
+(like `accel_limit` above) - otherwise the command is silently dropped.
 
 **Camera settings from the page**: the *Camera settings* controls (`target="camera"`) call your firmware's `/control?var=..&val=..`
 (quality, brightness, contrast, saturation, exposure, gain). For a moving belt, turn *Auto exposure* off and use a short manual
@@ -102,23 +126,25 @@ New kinds go in `divergence._check()`.
 * **Motor speed vs model**: the twin model receives the same commands as the real conveyor; measured RPM should follow it.
 * **Belt speed: encoder vs camera**: encoder RPM × 2πr against the median speed of tracked objects → detects belt slip.
 * **Object position vs prediction**: every object's position from the camera against where the encoder travel says it should be.
-* **Telemetry link**: telemetry older than `max_age_s`.
+* **Telemetry link**: telemetry (now over serial) older than `max_age_s`.
 * Rules only run in **Live sync** (except the link check) and need `hold_s` seconds of persistence before raising an alert.
 
 ## 6. Files
 
 | File | Role |
 |---|---|
-| `config.py` | everything you edit: variables, panels, plots, controls, rules, camera, MQTT |
+| `config.py` | everything you edit: variables, panels, plots, controls, rules, camera, serial, MQTT |
 | `app.py` | the web page (layout is generated from `config.py`), `assets/style.css` = look |
-| `mqtt_bridge.py` | MQTT in/out |
+| `serial_bridge.py` | conveyor in/out over USB serial (Arduino UNO) |
+| `mqtt_bridge.py` | MQTT in/out (camera/vision object broadcasts only) |
 | `twin_model.py` | simulated conveyor, derived variables, belt travel, runs the rules |
 | `divergence.py` | rule engine |
 | `vision.py` | MJPEG reader, YOLO tracking, pixel→cm, speed, annotated video, simulated vision |
 | `controls.py` | what happens when a widget changes |
 | `state.py` | shared thread-safe state |
-| `sim_esp32.py` | fake ESP32 for testing |
-| `firmware/esp32_conveyor/` | ESP32 controller sketch (PID + MQTT) |
+| `sim_conveyor.py` | fake Arduino for testing (virtual serial port) |
+| `firmware/arduino_uno_conveyor/` | Arduino UNO controller sketch (PID + serial) - the one currently used |
+| `firmware/esp32_conveyor/` | ESP32 controller sketch (PID + WiFi/MQTT) - kept for reference, not currently used (H-bridge driving issue) |
 | `firmware/esp32_cam/` | notes for the ESP32-CAM sketch and `secrets.h` template |
 
 ## 7. Known limitations
@@ -128,4 +154,5 @@ New kinds go in `divergence._check()`.
   create false divergences. The remaining constant delay (transport minimum) is not compensated; `Camera delay` shows the
   jitter on top of it. Timestamps are only used with the HTTP stream; videos/webcams use the PC clock.
 * Object speed comes from tracking the object's centre over ~1 s; very fast belts or low `infer_fps` make it noisy.
-* Run `python app.py` (not with Flask's reloader): the reloader would start every thread and MQTT client twice.
+* Run `python app.py` (not with Flask's reloader): the reloader would start every thread, the serial reader and the MQTT client twice.
+* Only one process can hold the Arduino's serial port at a time - close the Arduino IDE's Serial Monitor before running `app.py`.
