@@ -28,7 +28,14 @@ import config as cfg
 from state import is_num, state
 
 S = cfg.SERIAL
-_ARDUINO_HINTS = ("arduino", "ch340", "wch", "usb-serial", "usb2.0-serial", "usbmodem", "usbserial")
+_ARDUINO_HINTS = ("arduino", "ch340", "wch", "usb serial", "usb-serial", "usb2.0-serial", "usbmodem", "usbserial")
+# USB-serial chip vendor ids commonly found on Arduino (clone) boards, matched against p.hwid
+# ("...VID:PID=XXXX:YYYY...") - more reliable than the description text, which is often just a
+# generic "USB Serial" with no vendor name (that's what a genuine CH340 reports on Linux).
+_ARDUINO_VIDS = ("1a86",    # QinHeng CH340/CH341 - most common on UNO clones
+                 "0403",    # FTDI
+                 "10c4",    # Silicon Labs CP210x
+                 "2341", "2a03")  # Arduino LLC / Arduino SA (genuine boards)
 
 
 class SerialBridge:
@@ -54,9 +61,10 @@ class SerialBridge:
         configured = S.get("port", "auto")
         if configured and configured != "auto":
             return configured
-        for p in serial.tools.list_ports.comports():
+        candidates = list(serial.tools.list_ports.comports())
+        for p in candidates:
             desc = f"{p.description} {p.manufacturer or ''}".lower()
-            if any(hint in desc for hint in _ARDUINO_HINTS):
+            if any(hint in desc for hint in _ARDUINO_HINTS) or any(vid in (p.hwid or "").lower() for vid in _ARDUINO_VIDS):
                 return p.device
         return None
 

@@ -42,7 +42,9 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equi
 #                     P<float> | I<float> | D<float>     (Kp / Ki / Kd)
 # ════════════════════════════════════════════════════════════════════════════
 SERIAL = dict(
-    port="auto",        # "auto" = pick the first port that looks like an Arduino; or e.g. "/dev/ttyACM0"
+    port="/dev/ttyUSB0",   # set explicitly: two CH340 devices show up on this OrangePi (ls /dev/tty* | grep
+                           # USB before/after unplugging the Arduino to tell which is which) - "auto" can't
+                           # reliably pick between two identical-looking USB-serial chips.
     baud=115200,
     reconnect_s=2.0,
     heartbeat_s=1.0,     # re-send the last direction command this often, so the Arduino's link-loss
