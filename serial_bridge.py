@@ -9,6 +9,7 @@ the ESP32-CAM and still publishes detections over MQTT (see vision.py / mqtt_bri
 Protocol (must match firmware/arduino_uno_conveyor/arduino_uno_conveyor.ino):
   Arduino -> PC   one JSON line every 100 ms:
                   {"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","speed_pct":50,"distance_cm":58.5,"obj_speed_cm_s":0.0}
+                  (distance_cm = -1: no object in range; config.us_position_cm() turns it into a belt position)
   PC -> Arduino   one line per command:
                   F | R | S                        direction
                   V<0..100>                         speed setpoint, % of MAX_RPM

@@ -68,6 +68,25 @@ ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 # calibration controls) until the yellow mark lines up with the real mark in the image.
 CALIBRATION_MARK = dict(x_start_cm=28.7, width_cm=4.0)
 
+# HC-SR04 ultrasonic sensor (wired to the Arduino), looking along the belt at the objects on it.
+# Belt position of the object = sensor_x_cm + facing * distance (+ facing * object_half_len_cm).
+ULTRASONIC = dict(
+    sensor_x_cm=BELT_LENGTH_CM + 5.0,   # 5 cm past the far (forward) end of the belt
+    facing=-1,                          # -1: looks back towards x = 0 (objects moving Forward approach it)
+                                        # +1: if it is mounted before x = 0 looking forward instead
+    object_half_len_cm=0.0,             # the sensor sees the object's NEAR face, the camera its centre:
+                                        # set to half the object's length (along the belt) to compare them
+)
+
+
+def us_position_cm(distance_cm):
+    """Ultrasonic distance -> belt position of the object's centre (cm), or None if nothing is on the belt."""
+    if distance_cm is None or distance_cm < 0:          # firmware sends -1 when there is no echo
+        return None
+    u = ULTRASONIC
+    x = u["sensor_x_cm"] + u["facing"] * (distance_cm + u["object_half_len_cm"])
+    return x if 0.0 <= x <= BELT_LENGTH_CM else None
+
 # ════════════════════════════════════════════════════════════════════════════
 # Web app
 # ════════════════════════════════════════════════════════════════════════════
@@ -139,10 +158,11 @@ VARIABLES = [
     # speed % the Arduino actually holds - if this doesn't follow the slider, commands aren't arriving
     dict(id="speed_ack", label="Speed received", unit="%", source="serial", topic=TOPIC_TELEMETRY,
          key="speed_pct", fmt="{:.0f}"),
-    # HC-SR04 wired to the Arduino (optional, see the firmware's ULTRASONIC flag) - independent of the camera:
+    # HC-SR04 wired to the Arduino (optional, see the firmware's ULTRASONIC flag) - independent of the camera.
+    # distance_cm = -1 -> no object in range; obj_speed_cm_s > 0 -> object approaching the sensor.
     dict(id="us_distance_cm", label="Distance (ultrasonic)", unit="cm", source="serial", topic=TOPIC_TELEMETRY,
          key="distance_cm", fmt="{:.1f}"),
-    dict(id="us_obj_speed_cm_s", label="Object speed (ultrasonic)", unit="cm/s", source="serial", topic=TOPIC_TELEMETRY,
+    dict(id="us_obj_speed_cm_s", label="Approach speed (ultrasonic)", unit="cm/s", source="serial", topic=TOPIC_TELEMETRY,
          key="obj_speed_cm_s", fmt="{:.1f}"),
     # EXAMPLE - uncomment to add a motor current sensor (ACS712) in 2 minutes:
     # dict(id="current", label="Motor current", unit="A", source="serial", topic=TOPIC_TELEMETRY, key="current",
@@ -153,6 +173,8 @@ VARIABLES = [
     dict(id="belt_speed_cm_s", label="Belt speed (encoder)", unit="cm/s", source="derived", fmt="{:.1f}",
          color="#1f5fbf",
          fn=lambda v: ENCODER_SIGN * v["rpm"] / 60.0 * 2 * math.pi * ROLLER_RADIUS_CM),   # Eq. (1) of the lab guide
+    dict(id="us_x_cm", label="Object position (ultrasonic)", unit="cm", source="derived", fmt="{:.1f}",
+         color="#2f8f5b", fn=lambda v: us_position_cm(v["us_distance_cm"])),
 
     # --- digital twin model (twin_model.py) --------------------------------
     dict(id="model_rpm", label="Model speed", unit="RPM", source="model", fmt="{:.0f}", color="#d98a00"),
@@ -172,6 +194,7 @@ VARIABLES = [
 PANELS = [
     dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "speed_ack", "belt_speed_cm_s"]),
     dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_fps", "cam_lag_ms"]),
+    dict(title="Ultrasonic", vars=["us_distance_cm", "us_x_cm", "us_obj_speed_cm_s"]),
     dict(title="Twin model", vars=["model_rpm", "model_belt_speed_cm_s"]),
 ]
 
@@ -211,6 +234,11 @@ CONTROLS = [
          target="real", topic=f"{TOPIC_PREFIX}/cmd/ki"),
     dict(id="kd", group="PID gains", label="Kd", kind="number", step=0.05, default=0.0,
          target="real", topic=f"{TOPIC_PREFIX}/cmd/kd"),
+
+    # Which sensor places the object(s) drawn on the belt and listed in the objects table:
+    dict(id="pos_source", group="Belt view", label="Object position from", kind="buttons",
+         options=[("Camera", "camera"), ("Ultrasonic", "ultrasonic")], default="camera",
+         target="twin", model_var="pos_source"),
 
     # Twin-only "what-if / fault injection" (lab guide section 5.3):
     dict(id="fault_loss", group="Twin what-if", label="Inject speed loss (twin only)", unit="%", kind="slider",

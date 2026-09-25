@@ -125,17 +125,32 @@ def divergence_view():
     return card("Divergence: physical vs digital", *rows, note)
 
 
+def belt_objects():
+    """Objects to draw/list, from the sensor picked with the "Object position from" control.
+    The ultrasonic sensor only sees the object nearest to it, so it gives at most one object."""
+    if state.params.get("pos_source", "camera") != "ultrasonic":
+        return list(state.objects)
+    x = cfg.us_position_cm(state.get("us_distance_cm"))
+    if x is None:
+        return []
+    approach = state.get("us_obj_speed_cm_s")
+    speed = None if approach is None else -cfg.ULTRASONIC["facing"] * approach   # approach speed -> belt x direction
+    return [dict(id="US", label="ultrasonic", x_cm=x, speed_cm_s=speed, expected_cm=None, err_cm=None, diverging=False)]
+
+
 def objects_view():
     head = html.Tr([html.Th(h) for h in ("Id", "Class", "x (cm)", "v (cm/s)", "Δ pred. (cm)")])
     rows = []
-    for o in sorted(state.objects, key=lambda o: o["id"]):
+    ultrasonic = state.params.get("pos_source") == "ultrasonic"
+    for o in sorted(belt_objects(), key=lambda o: str(o["id"])):
         sp = "—" if o["speed_cm_s"] is None else f"{o['speed_cm_s']:+.1f}"
         er = "—" if o["err_cm"] is None else f"{o['err_cm']:+.1f}"
         rows.append(html.Tr(className="bad" if o.get("diverging") else "", children=[
             html.Td(o["id"]), html.Td(o["label"]), html.Td(f"{o['x_cm']:.1f}"), html.Td(sp), html.Td(er)]))
     if not rows:
         rows = [html.Tr(html.Td("No objects detected on the belt", colSpan=5, className="empty"))]
-    return card("Objects seen by the camera", html.Table(className="tbl", children=[html.Thead(head), html.Tbody(rows)]))
+    title = "Object seen by the ultrasonic sensor" if ultrasonic else "Objects seen by the camera"
+    return card(title, html.Table(className="tbl", children=[html.Thead(head), html.Tbody(rows)]))
 
 
 def events_view():
@@ -198,7 +213,14 @@ def belt_figure():
         k += 1
     fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", hoverinfo="skip", line=dict(color="#556173", width=2)))
 
-    objs = list(state.objects)
+    # ultrasonic sensor position (it may sit past the end of the belt)
+    ux = cfg.ULTRASONIC["sensor_x_cm"]
+    fig.add_trace(go.Scatter(x=[ux], y=[3], mode="markers+text", text=["US"], textposition="bottom center",
+                             hoverinfo="skip", textfont=dict(color=INK, size=11),
+                             marker=dict(symbol="triangle-left" if cfg.ULTRASONIC["facing"] < 0 else "triangle-right",
+                                         size=18, color=GREEN, line=dict(color=INK, width=1))))
+
+    objs = belt_objects()
     # expected positions (predicted from encoder travel)
     ex = [o for o in objs if o["err_cm"] is not None and abs(o["err_cm"]) > 0.5]
     if ex:
@@ -222,7 +244,8 @@ def belt_figure():
     else:
         head, col = f"◀ ◀ ◀   Reverse   {abs(speed):.1f} cm/s", COBALT
     fig.add_annotation(x=L / 2, y=7.5, text=f"<b>{head}</b>", showarrow=False, font=dict(size=20, color=col))
-    fig.add_annotation(x=0, y=6.2, text="camera view (calibrated 0 – 60 cm)", showarrow=False, xanchor="left",
+    src = "ultrasonic sensor" if state.params.get("pos_source") == "ultrasonic" else f"camera (calibrated 0 – {L:g} cm)"
+    fig.add_annotation(x=0, y=6.2, text=f"object position from: {src}", showarrow=False, xanchor="left",
                        font=dict(size=11, color=PURPLE))
     if sandbox:
         fig.add_annotation(x=0, y=7.5, text="Sandbox: showing the twin model", showarrow=False, xanchor="left",
@@ -231,7 +254,7 @@ def belt_figure():
     fig.update_layout(
         showlegend=False, margin=dict(l=10, r=10, t=4, b=44), uirevision="belt",
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", font=dict(color=INK),
-        xaxis=dict(range=[-6, L + 6], tickvals=list(range(0, int(L) + 1, 5)), ticksuffix=" cm", showgrid=False,
+        xaxis=dict(range=[min(-6, ux - 4), max(L + 6, ux + 4)], tickvals=list(range(0, int(L) + 1, 5)), ticksuffix=" cm", showgrid=False,
                    zeroline=False, ticks="outside", linecolor=INK, fixedrange=True),
         yaxis=dict(range=[0, 8.2], visible=False, fixedrange=True))
     return fig

@@ -81,7 +81,7 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
 
 | Line | Direction | Payload |
 |---|---|---|
-| telemetry | Arduino → PC | `{"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","distance_cm":58.5,"obj_speed_cm_s":0.0}` (10 Hz, rpm is signed; the `distance_cm`/`obj_speed_cm_s` fields need the optional HC-SR04, see the firmware's `ULTRASONIC` flag) |
+| telemetry | Arduino → PC | `{"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","distance_cm":58.5,"obj_speed_cm_s":0.0}` (10 Hz, rpm is signed; the `distance_cm`/`obj_speed_cm_s` fields need the optional HC-SR04, see the firmware's `ULTRASONIC` flag; `distance_cm` = -1 means no object in range, belt position is computed from `config.ULTRASONIC`) |
 | direction | PC → Arduino | `F`, `R` or `S` |
 | speed | PC → Arduino | `V0`–`V100` (% of `MAX_RPM`) |
 | PID gains | PC → Arduino | `P<float>`, `I<float>`, `D<float>` |

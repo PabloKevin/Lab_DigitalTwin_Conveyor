@@ -25,6 +25,7 @@
   Telemetry, one JSON line every 100 ms:
     {"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","speed_pct":50,"distance_cm":58.5,"obj_speed_cm_s":0.0}
   NOTE: the encoder is single channel, so the sign of rpm comes from the commanded direction.
+  distance_cm = -1 means no object in range; obj_speed_cm_s > 0 means approaching the sensor.
 */
 #include <PID_v1.h>
 
@@ -99,8 +100,14 @@ double setpoint = 0, input = 0, output = 0;
 PID pid(&input, &output, &setpoint, kp, ki, kd, DIRECT);
 
 #if ULTRASONIC
-float distanceCm = 0, lastDistanceCm = 0, objSpeedCmS = 0;
-const float DIST_DETECT_THRESHOLD_CM = 55.0;
+// The app converts distance -> belt position (config.ULTRASONIC); here we only report a clean distance.
+const float US_MIN_CM = 2.0;                  // HC-SR04 blind zone
+const float US_MAX_CM = 80.0;                 // beyond the far end of the belt (68 cm + 6 cm offset) = no object
+const unsigned long US_TIMEOUT_US = 6000;     // echo time for ~100 cm; also bounds how long pulseIn blocks
+const byte US_MAX_MISSES = 3;                 // keep the last reading through this many bad echoes
+const float US_MAX_STEP_CM = 6.0;             // > max belt travel in 100 ms (~4 cm): a bigger jump = new object
+float distanceCm = -1, lastDistanceCm = -1, objSpeedCmS = 0;   // -1 = no object in range
+byte usMisses = 0;
 #endif
 
 unsigned long lastSample = 0, lastRx = 0;
@@ -145,14 +152,19 @@ void readUltrasonic() {
   delayMicroseconds(10);
   digitalWrite(TRIG, LOW);
 
-  long duration = pulseIn(ECHO, HIGH, 15000);
-  if (duration > 0) {
-    float d = duration * 0.034 / 2.0;
-    if (d >= 2.0 && d <= 60.0) distanceCm = d;
+  long duration = pulseIn(ECHO, HIGH, US_TIMEOUT_US);
+  float d = duration * 0.034 / 2.0;
+  if (duration > 0 && d >= US_MIN_CM && d <= US_MAX_CM) {
+    distanceCm = d;
+    usMisses = 0;
+  } else if (++usMisses >= US_MAX_MISSES) {  // a single lost echo keeps the last value; several = gone
+    usMisses = US_MAX_MISSES;
+    distanceCm = -1;
   }
-  if (lastDistanceCm > 0 && distanceCm < DIST_DETECT_THRESHOLD_CM) {
+
+  // Object speed, positive = approaching the sensor (signed, so it also works in reverse).
+  if (lastDistanceCm > 0 && distanceCm > 0 && fabs(lastDistanceCm - distanceCm) <= US_MAX_STEP_CM) {
     float v = (lastDistanceCm - distanceCm) / 0.1;
-    if (v < 0) v = 0;
     objSpeedCmS = 0.3 * v + 0.7 * objSpeedCmS;
   } else {
     objSpeedCmS = 0.0;
