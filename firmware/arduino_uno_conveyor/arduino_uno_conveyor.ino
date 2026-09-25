@@ -40,26 +40,45 @@
 
 // ── conveyor ───────────────────────────────────────────────────────────
 const float PPR = 20.0;                       // 60e6 / PPR = 3,000,000 as in the old sketch
-const float MAX_RPM = 200.0;                  // V100 -> 200 RPM (old map(vel,0,100,0,200)); must match config.py
+const float MAX_RPM = 300.0;                  // V100 -> 200 RPM (old map(vel,0,100,0,200)); must match config.py
 const float MAX_RPM_PHYSICAL = 250.0;         // RPM estimates above this are glitches
 const unsigned long SAMPLE_MS = 100;
 const unsigned long FAILSAFE_MS = 3000;
 
 // ── encoder: pulse-interval buffer ───────────────────────────────────────
 #define NUM_INTERVALS 4
+const unsigned long MIN_INTERVAL_US = 8000;   // lockout between accepted pulses (375 RPM max)
+const unsigned long MIN_HIGH_US = 1500;       // a falling edge only counts if the line was HIGH this long
+                                              // before it (rejects chatter; half-period at 300 RPM = 5 ms)
+const unsigned long STOP_TIMEOUT_US = 400000; // no pulse for this long = stopped
 volatile unsigned long intervalBuf[NUM_INTERVALS] = {0, 0, 0, 0};
 volatile byte intervalIdx = 0;
 volatile unsigned long lastPulseTime = 0;
+volatile unsigned long lastEdgeTime = 0;
+volatile unsigned int rawEdges = 0;           // every falling edge seen (diagnostic)
+volatile unsigned int acceptedPulses = 0;     // falling edges that passed the filters (diagnostic)
 float rpmFiltered = 0;
 
+// CHANGE interrupt: rising edges only restart the HIGH timer; a falling edge is a pulse only if
+// the line was stably HIGH before it. Chatter while a slot edge passes slowly (or PWM noise) makes
+// short HIGH blips, which the old FALLING + 8 ms lockout counted as extra pulses -> RPM read too high.
 void encoderISR() {
   unsigned long now = micros();
+  bool high = PIND & _BV(PD2);                // = digitalRead(ENC_A) on the UNO, ~30x faster (keeps the ISR
+                                              // short so a noisy encoder line can't starve the serial RX)
+  unsigned long held = now - lastEdgeTime;
+  lastEdgeTime = now;
+  if (high) return;
+  rawEdges++;
+  if (held < MIN_HIGH_US) return;
+
   unsigned long dt = now - lastPulseTime;
-  if (dt > 8000) {
-    intervalBuf[intervalIdx] = dt;
-    intervalIdx = (intervalIdx + 1) % NUM_INTERVALS;
-    lastPulseTime = now;
-  }
+  if (dt <= MIN_INTERVAL_US) return;
+  lastPulseTime = now;
+  acceptedPulses++;
+  if (dt > STOP_TIMEOUT_US) return;           // first pulse after standstill: no valid interval yet
+  intervalBuf[intervalIdx] = dt;
+  intervalIdx = (intervalIdx + 1) % NUM_INTERVALS;
 }
 
 char dirCmd = 'S';
@@ -128,18 +147,27 @@ void readUltrasonic() {
 }
 #endif
 
-void handleCommand(char cmd) {
-  switch (cmd) {
+// One complete line, e.g. "V50" or "P0.4". A value that doesn't parse is ignored instead of becoming
+// 0 (Serial.parseFloat() returned 0 on a lost/garbled byte, and blocked the loop up to 1 s meanwhile).
+void handleLine(char *line) {
+  char *end;
+  double val = strtod(line + 1, &end);
+  bool hasVal = end != line + 1 && *end == '\0';
+  switch (line[0]) {
     case 'F': driveForward(); break;
     case 'R': driveReverse(); break;
     case 'S': stopMotor(); break;
-    case 'V': speedPct = constrain(Serial.parseFloat(), 0, 100); break;
-    case 'P': kp = Serial.parseFloat(); pid.SetTunings(kp, ki, kd); break;
-    case 'I': ki = Serial.parseFloat(); pid.SetTunings(kp, ki, kd); break;
-    case 'D': kd = Serial.parseFloat(); pid.SetTunings(kp, ki, kd); break;
+    case 'V': if (hasVal) speedPct = constrain(val, 0, 100); break;
+    case 'P': if (hasVal && val >= 0) { kp = val; pid.SetTunings(kp, ki, kd); } break;
+    case 'I': if (hasVal && val >= 0) { ki = val; pid.SetTunings(kp, ki, kd); } break;
+    case 'D': if (hasVal && val >= 0) { kd = val; pid.SetTunings(kp, ki, kd); } break;
     case 'H': hostLinked = true; break;
   }
 }
+
+char rxBuf[16];
+byte rxLen = 0;
+bool rxOverflow = false;
 
 void setup() {
   Serial.begin(115200);
@@ -151,7 +179,7 @@ void setup() {
   pinMode(IN2, OUTPUT);
   pinMode(ENA, OUTPUT);
 
-  attachInterrupt(digitalPinToInterrupt(ENC_A), encoderISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(ENC_A), encoderISR, CHANGE);
 
   pid.SetMode(MANUAL);
   pid.SetOutputLimits(40, 255);
@@ -161,12 +189,21 @@ void setup() {
 }
 
 void loop() {
-  // ---- commands ----
+  // ---- commands (non-blocking: collect a line, run it on '\n') ----
   while (Serial.available() > 0) {
-    char cmd = Serial.read();
-    if (cmd == '\n' || cmd == '\r' || cmd == ' ') continue;
-    lastRx = millis();
-    handleCommand(cmd);
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (rxLen > 0 && !rxOverflow) {
+        rxBuf[rxLen] = '\0';
+        lastRx = millis();
+        handleLine(rxBuf);
+      }
+      rxLen = 0;
+      rxOverflow = false;
+    } else if (c != ' ') {
+      if (rxLen < sizeof(rxBuf) - 1) rxBuf[rxLen++] = c;
+      else rxOverflow = true;
+    }
   }
 
   // ---- failsafe (only while the PC app is in charge) ----
@@ -190,10 +227,12 @@ void loop() {
     if (intervalBuf[i] > 0) { sumIntervals += intervalBuf[i]; validSamples++; }
   }
   unsigned long sinceLastPulse = micros() - lastPulseTime;
+  unsigned int edges = rawEdges, pulses = acceptedPulses;
+  rawEdges = acceptedPulses = 0;
   interrupts();
 
   float rpmInstant = 0.0;
-  if (sinceLastPulse > 400000) {
+  if (sinceLastPulse > STOP_TIMEOUT_US) {
     noInterrupts();
     for (int i = 0; i < NUM_INTERVALS; i++) intervalBuf[i] = 0;
     interrupts();
@@ -202,8 +241,9 @@ void loop() {
     rpmInstant = (calc <= MAX_RPM_PHYSICAL) ? calc : rpmFiltered;
   }
 
-  float rpmTemp = 0.2 * rpmInstant + 0.8 * rpmFiltered;
-  if (fabs(rpmTemp - rpmFiltered) >= 2.5 || rpmInstant == 0.0) rpmFiltered = rpmTemp;
+  // Plain EMA. The old "deadband" compared 0.2*(instant - filtered) against 2.5, i.e. it froze the
+  // reading until the real speed moved >12.5 RPM away, then jumped - and the PID integrated meanwhile.
+  rpmFiltered = 0.2 * rpmInstant + 0.8 * rpmFiltered;
 
   // ---- PID + motor (same structure as the validated sketch) ----
   setpoint = MAX_RPM * speedPct / 100.0;
@@ -228,6 +268,16 @@ void loop() {
   Serial.print(dirCmd);
   Serial.print(F("\",\"speed_pct\":"));
   Serial.print(speedPct, 0);
+  Serial.print(F(",\"edges\":"));             // diagnostic: falling edges seen this sample
+  Serial.print(edges);
+  Serial.print(F(",\"pulses\":"));            // diagnostic: edges accepted as encoder pulses
+  Serial.print(pulses);
+  Serial.print(F(",\"kp\":"));                // diagnostic: gains the board is actually using
+  Serial.print(kp, 2);
+  Serial.print(F(",\"ki\":"));
+  Serial.print(ki, 2);
+  Serial.print(F(",\"kd\":"));
+  Serial.print(kd, 2);
 #if ULTRASONIC
   Serial.print(F(",\"distance_cm\":"));
   Serial.print(distanceCm, 1);

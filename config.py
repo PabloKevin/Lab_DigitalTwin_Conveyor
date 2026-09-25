@@ -43,7 +43,7 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equi
 #                     H                                  (keep-alive, arms the Arduino's failsafe)
 # ════════════════════════════════════════════════════════════════════════════
 SERIAL = dict(
-    port="/dev/ttyUSB1",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
+    port="/dev/ttyUSB0",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
                            # connection (also CH340), not the Arduino - confirmed by reading raw serial:
                            # it printed the ESP32-CAM firmware's "WiFi RSSI ... free heap ..." debug line.
     baud=115200,
