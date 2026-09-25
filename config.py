@@ -82,9 +82,12 @@ STALE_AFTER_S = 2.0        # a value older than this is shown as "—" / conside
 VISION = dict(
     mode="bgsub",           # "bgsub" = real camera + background subtraction | "sim" = fake objects (no camera) | "off"
     # ESP32-CAM firmware: stream on port 81, settings endpoint /control on port 80 (also accepts a video file or 0 = webcam).
-    # If esp32cam.local does not resolve on Ubuntu use its IP (see the serial monitor) or: sudo apt install avahi-daemon libnss-mdns
-    camera_url="http://esp32cam.local:81/stream",
-    camera_control_url="http://esp32cam.local",
+    # Using the ESP32-CAM's real IP instead of esp32cam.local (mDNS) - avoids depending on avahi-daemon/
+    # libnss-mdns being installed, which isn't a given on minimal OrangePi images. Found via nmap -p 80,81
+    # <subnet>: the host with both 80 and 81 open is the camera. Re-check this if the camera gets a new
+    # DHCP lease (e.g. after a router reboot) - a static DHCP reservation on the router avoids that.
+    camera_url="http://10.82.234.15:81/stream",
+    camera_control_url="http://10.82.234.15",
     # Background subtraction (OpenCV MOG2) - no GPU/ML runtime, cheap enough for a Pi-class board.
     # The belt must be empty and mostly static for a few seconds after startup so it can learn the background.
     bg_history=500,          # frames used to build the background model
