@@ -25,8 +25,12 @@ pip install -r requirements.txt
 python sim_conveyor.py                 # terminal 1  fake conveyor over a virtual serial port
 # it prints a path like /dev/pts/4 - copy it into config.py's SERIAL["port"] (replacing "auto")
 # in config.py also set VISION["mode"] = "sim"   (fake objects riding the belt)
-python app.py                          # terminal 2  opens http://127.0.0.1:8050
+python app.py                          # terminal 2
 ```
+
+`app.py` listens on `WEB["host"] = "0.0.0.0"` by default, so open `http://<board-ip>:8050` from any machine
+on the same LAN (find the board's IP with `hostname -I`), not just `http://127.0.0.1:8050` on the board itself.
+If it doesn't load from another machine, check the board's firewall allows port 8050 (e.g. `sudo ufw allow 8050/tcp`).
 
 In the page: set **Direction = Forward** and **Speed = 10 %**. Then try
 * *Twin what-if → Inject speed loss* (twin only): the model slows down, the **Motor speed vs model** rule fires.

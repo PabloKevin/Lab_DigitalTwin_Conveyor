@@ -68,7 +68,10 @@ CALIBRATION_MARK = dict(x_start_cm=28.7, width_cm=4.0)
 # ════════════════════════════════════════════════════════════════════════════
 # Web app
 # ════════════════════════════════════════════════════════════════════════════
-WEB = dict(host="127.0.0.1", port=8050, open_browser=True)
+WEB = dict(host="0.0.0.0", port=8050, open_browser=False)
+# host="0.0.0.0": listen on every network interface, not just localhost, so other machines on the
+# same LAN can open http://<orangepi-ip>:8050 (find the IP with `hostname -I` on the OrangePi).
+# open_browser=False: no desktop/browser to launch on a headless board - set True if you do have one.
 HISTORY_SECONDS = 60       # length of the time-series plots
 HISTORY_DT = 0.1           # minimum spacing between stored points (s)
 STALE_AFTER_S = 2.0        # a value older than this is shown as "—" / considered missing
