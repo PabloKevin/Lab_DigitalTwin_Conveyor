@@ -46,7 +46,7 @@ try:
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             line = line.decode(errors="replace").strip()
-            if not line:
+            if not line or line == "H":                   # H = keep-alive, nothing to simulate
                 continue
             cmd, rest = line[0], line[1:]
             try:
@@ -67,7 +67,7 @@ try:
         rpm = st["rpm"] + random.gauss(0, 1.2)
         pwm = min(255, abs(target) / cfg.MAX_RPM * 255 * 1.05)
         line = json.dumps(dict(rpm=round(rpm, 1), setpoint=round(sign * cfg.MAX_RPM * st["speed"] / 100.0, 1),
-                                output=round(pwm), dir=st["direction"])) + "\n"
+                                output=round(pwm), dir=st["direction"], speed_pct=st["speed"])) + "\n"
         os.write(master, line.encode())
         time.sleep(dt)
 except KeyboardInterrupt:

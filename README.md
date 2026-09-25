@@ -52,8 +52,11 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
    Plug it into the PC via USB, then in `config.py` set `SERIAL["port"]` - leave it `"auto"` to let
    `serial_bridge.py` pick the first port that looks like an Arduino, or set it explicitly (check with
    `ls /dev/tty*` before/after plugging it in - usually `/dev/ttyACM0` or `/dev/ttyUSB0` on Linux). The
-   motor stops if no command arrives for 3 s (`app.py` re-sends the current direction every second as a
-   heartbeat even when unchanged, so a genuinely lost USB link is what trips this, not an idle UI).
+   motor stops if the app's `H` keep-alive (sent every second) is missing for 3 s - i.e. `app.py` died or
+   the USB link dropped. That failsafe only arms once the app has connected, so you can still drive it by
+   hand from the Arduino IDE Serial Monitor (115200 baud, "Newline"): `V50`, `F`, `R`, `S`, like the old sketch.
+   Opening the port resets the UNO; `app.py` then pushes the page's speed and PID gains to it, but leaves
+   the belt stopped until you press a direction again.
 2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
    `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
    (IP or `esp32cam.local`) and `VISION["mode"] = "bgsub"`. If `.local` does not resolve on Ubuntu:

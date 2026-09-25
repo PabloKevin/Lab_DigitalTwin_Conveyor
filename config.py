@@ -40,6 +40,7 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equi
 #     PC -> Arduino   one line per command: F | R | S   (direction)
 #                     V<0..100>                          (speed, % of MAX_RPM)
 #                     P<float> | I<float> | D<float>     (Kp / Ki / Kd)
+#                     H                                  (keep-alive, arms the Arduino's failsafe)
 # ════════════════════════════════════════════════════════════════════════════
 SERIAL = dict(
     port="/dev/ttyUSB1",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
@@ -47,8 +48,8 @@ SERIAL = dict(
                            # it printed the ESP32-CAM firmware's "WiFi RSSI ... free heap ..." debug line.
     baud=115200,
     reconnect_s=2.0,
-    heartbeat_s=1.0,     # re-send the last direction command this often, so the Arduino's link-loss
-                         # failsafe (FAILSAFE_MS) sees traffic even when nothing has changed
+    heartbeat_s=1.0,     # send the "H" keep-alive this often; the Arduino stops the motor after
+                         # FAILSAFE_MS (3 s) without it, i.e. if app.py dies or the USB link drops
 )
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -56,7 +57,7 @@ SERIAL = dict(
 # ════════════════════════════════════════════════════════════════════════════
 BELT_LENGTH_CM = 68.0
 ROLLER_RADIUS_CM = 1.30     # drive roller radius (lab guide: r = 5 cm)
-MAX_RPM = 300.0            # RPM at 100 % speed (same mapping as the Arduino code)
+MAX_RPM = 200.0            # RPM at 100 % speed - must match MAX_RPM in arduino_uno_conveyor.ino
 ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 
 # Physical ground-truth reference glued/taped onto the belt, used to check and fine-tune the
@@ -135,6 +136,9 @@ VARIABLES = [
     dict(id="pwm", label="PWM output", unit="/255", source="serial", topic=TOPIC_TELEMETRY, key="output", fmt="{:.0f}",
          warn=(None, 230), alarm=(None, 250)),
     dict(id="direction", label="Direction", source="serial", topic=TOPIC_TELEMETRY, key="dir"),
+    # speed % the Arduino actually holds - if this doesn't follow the slider, commands aren't arriving
+    dict(id="speed_ack", label="Speed received", unit="%", source="serial", topic=TOPIC_TELEMETRY,
+         key="speed_pct", fmt="{:.0f}"),
     # HC-SR04 wired to the Arduino (optional, see the firmware's ULTRASONIC flag) - independent of the camera:
     dict(id="us_distance_cm", label="Distance (ultrasonic)", unit="cm", source="serial", topic=TOPIC_TELEMETRY,
          key="distance_cm", fmt="{:.1f}"),
@@ -166,7 +170,7 @@ VARIABLES = [
 # PANELS  (variable "windows").  Variables not listed anywhere go to an "Other" panel.
 # ════════════════════════════════════════════════════════════════════════════
 PANELS = [
-    dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "belt_speed_cm_s"]),
+    dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "speed_ack", "belt_speed_cm_s"]),
     dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_fps", "cam_lag_ms"]),
     dict(title="Twin model", vars=["model_rpm", "model_belt_speed_cm_s"]),
 ]
@@ -199,11 +203,13 @@ CONTROLS = [
          min=0, max=100, step=1, default=0,
          target="both", topic=f"{TOPIC_PREFIX}/cmd/speed", model_var="speed_pct"),
 
-    dict(id="kp", group="PID gains", label="Kp", kind="number", step=0.1, default=2.0,
+    # Defaults = the gains validated on the real conveyor; serial_bridge.py pushes them (and the speed)
+    # to the Arduino every time it connects, so keep these in sync with the firmware's kp/ki/kd.
+    dict(id="kp", group="PID gains", label="Kp", kind="number", step=0.1, default=0.4,
          target="real", topic=f"{TOPIC_PREFIX}/cmd/kp"),
     dict(id="ki", group="PID gains", label="Ki", kind="number", step=0.1, default=0.5,
          target="real", topic=f"{TOPIC_PREFIX}/cmd/ki"),
-    dict(id="kd", group="PID gains", label="Kd", kind="number", step=0.05, default=0.1,
+    dict(id="kd", group="PID gains", label="Kd", kind="number", step=0.05, default=0.0,
          target="real", topic=f"{TOPIC_PREFIX}/cmd/kd"),
 
     # Twin-only "what-if / fault injection" (lab guide section 5.3):

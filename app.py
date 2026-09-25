@@ -270,7 +270,7 @@ def widget(c):
                           tooltip={"placement": "bottom", "always_visible": True}, updatemode="mouseup")
     if k == "buttons":
         return dcc.RadioItems(id=cid, options=[{"label": l, "value": v} for l, v in c["options"]], value=val,
-                              className="seg", labelClassName="seg-l", inputClassName="seg-i")
+                              className="seg", inline=True)
     if k == "number":
         return dcc.Input(id=cid, type="number", value=val, step=c.get("step", 1), min=c.get("min"), max=c.get("max"),
                          debounce=True, className="num")
@@ -303,9 +303,8 @@ def serve_layout():
                                html.P(f"{L:g} cm belt · Arduino over serial · camera + bg subtraction", className="sub")]),
             html.Div(id="badges", className="badges"),
             html.Div(className="actions", children=[
-                dcc.RadioItems(id="sync", value="live" if state.sync else "sandbox", className="seg", labelClassName="seg-l",
-                               inputClassName="seg-i", options=[{"label": "Live sync", "value": "live"},
-                                                                {"label": "Sandbox", "value": "sandbox"}]),
+                dcc.RadioItems(id="sync", value="live" if state.sync else "sandbox", className="seg", inline=True,
+                               options=[{"label": "Live sync", "value": "live"}, {"label": "Sandbox", "value": "sandbox"}]),
                 html.Button("E-stop", id="estop", className="estop"),
             ]),
         ]),

@@ -8,11 +8,12 @@ the ESP32-CAM and still publishes detections over MQTT (see vision.py / mqtt_bri
 
 Protocol (must match firmware/arduino_uno_conveyor/arduino_uno_conveyor.ino):
   Arduino -> PC   one JSON line every 100 ms:
-                  {"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","distance_cm":58.5,"obj_speed_cm_s":0.0}
+                  {"rpm":-12.0,"setpoint":100.0,"output":120,"dir":"F","speed_pct":50,"distance_cm":58.5,"obj_speed_cm_s":0.0}
   PC -> Arduino   one line per command:
                   F | R | S                        direction
                   V<0..100>                         speed setpoint, % of MAX_RPM
                   P<float> | I<float> | D<float>    Kp / Ki / Kd
+                  H                                 keep-alive every heartbeat_s (arms the Arduino's failsafe)
 
 Exposes the same interface app.py/controls.py already use for the MQTT bridge (start(), publish()),
 so CONTROLS in config.py (topics "conveyor/cmd/...") did not need to change - only the transport did.
@@ -48,7 +49,6 @@ class SerialBridge:
 
         self._ser = None
         self._lock = threading.Lock()
-        self._last_dir_line = "S"
         self._last_err = 0
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -80,9 +80,10 @@ class SerialBridge:
                     with self._lock:
                         self._ser = ser
                     state.log(f"Serial connected to {port}")
-                    time.sleep(2.0)                      # let the Arduino finish its auto-reset boot
-                    for raw in ser:
-                        line = raw.decode("utf-8", errors="replace").strip()
+                    time.sleep(2.0)                      # opening the port resets the UNO; wait for it to boot
+                    self._sync_controls()
+                    while True:                          # a quiet second is not a disconnect - only exceptions are
+                        line = ser.readline().decode("utf-8", errors="replace").strip()
                         if line:
                             self._handle_line(line)
             except (serial.SerialException, OSError) as e:
@@ -93,10 +94,22 @@ class SerialBridge:
             time.sleep(S["reconnect_s"])
 
     def _heartbeat_loop(self):
-        """Re-sends the last direction even if unchanged, so the Arduino's link-loss failsafe sees traffic."""
+        """Keep-alive 'H': arms the Arduino's link-loss failsafe and keeps it fed while the app runs."""
         while True:
             time.sleep(S["heartbeat_s"])
-            self._write(self._last_dir_line, quiet=True)
+            self._write("H", quiet=True)
+
+    def _sync_controls(self):
+        """The UNO just rebooted with its own defaults - push the page's current speed and PID gains.
+        Direction is deliberately NOT re-sent: after a reset the belt stays stopped until you press it again."""
+        if not state.sync:
+            return
+        import controls
+        for c in cfg.CONTROLS:
+            key = c.get("topic", "").rsplit("/", 1)[-1]
+            if c.get("target") in ("real", "both") and key != "direction" and c["id"] in state.controls:
+                payload, _ = controls.payload_text(c, state.controls[c["id"]])
+                self.publish(c["topic"], payload, quiet=True)
 
     # ── incoming ───────────────────────────────────────────────────────────
     def _handle_line(self, line):
@@ -147,7 +160,4 @@ class SerialBridge:
                 "kp": lambda p: f"P{p}", "ki": lambda p: f"I{p}", "kd": lambda p: f"D{p}"}.get(key)
         if line is None:
             return False
-        line = line(payload)
-        if key == "direction":
-            self._last_dir_line = line
-        return self._write(line, quiet=quiet)
+        return self._write(line(payload), quiet=quiet)
