@@ -42,9 +42,9 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equi
 #                     P<float> | I<float> | D<float>     (Kp / Ki / Kd)
 # ════════════════════════════════════════════════════════════════════════════
 SERIAL = dict(
-    port="/dev/ttyUSB0",   # set explicitly: two CH340 devices show up on this OrangePi (ls /dev/tty* | grep
-                           # USB before/after unplugging the Arduino to tell which is which) - "auto" can't
-                           # reliably pick between two identical-looking USB-serial chips.
+    port="/dev/ttyUSB1",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
+                           # connection (also CH340), not the Arduino - confirmed by reading raw serial:
+                           # it printed the ESP32-CAM firmware's "WiFi RSSI ... free heap ..." debug line.
     baud=115200,
     reconnect_s=2.0,
     heartbeat_s=1.0,     # re-send the last direction command this often, so the Arduino's link-loss
