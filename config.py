@@ -43,7 +43,7 @@ STATUS_TOPIC = f"{TOPIC_PREFIX}/status"         # unused now (serial has no equi
 #                     H                                  (keep-alive, arms the Arduino's failsafe)
 # ════════════════════════════════════════════════════════════════════════════
 SERIAL = dict(
-    port="/dev/ttyUSB0",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
+    port="/dev/ttyUSB1",   # set explicitly: ttyUSB0 turned out to be the ESP32-CAM's own USB-serial
                            # connection (also CH340), not the Arduino - confirmed by reading raw serial:
                            # it printed the ESP32-CAM firmware's "WiFi RSSI ... free heap ..." debug line.
     baud=115200,
@@ -200,7 +200,7 @@ CONTROLS = [
          options=[("Forward", "F"), ("Stop", "S"), ("Reverse", "R")], default="S",
          target="both", topic=f"{TOPIC_PREFIX}/cmd/direction", model_var="direction"),
     dict(id="speed", group="Motion", label="Speed setpoint", unit="%", kind="slider",
-         min=0, max=100, step=1, default=0,
+         min=20, max=100, step=1, default=20,   # below ~20 % (60 RPM) the belt stalls; use Stop to stop
          target="both", topic=f"{TOPIC_PREFIX}/cmd/speed", model_var="speed_pct"),
 
     # Defaults = the gains validated on the real conveyor; serial_bridge.py pushes them (and the speed)

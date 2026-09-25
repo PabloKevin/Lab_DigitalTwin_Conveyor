@@ -40,10 +40,20 @@
 
 // ── conveyor ───────────────────────────────────────────────────────────
 const float PPR = 20.0;                       // 60e6 / PPR = 3,000,000 as in the old sketch
-const float MAX_RPM = 300.0;                  // V100 -> 200 RPM (old map(vel,0,100,0,200)); must match config.py
-const float MAX_RPM_PHYSICAL = 250.0;         // RPM estimates above this are glitches
+const float MAX_RPM = 300.0;                  // V100 -> 300 RPM; must match config.py
+const float MAX_RPM_PHYSICAL = 350.0;         // RPM estimates above this are glitches (must be > MAX_RPM;
+                                              // the 8 ms ISR lockout caps readings at 375 anyway)
 const unsigned long SAMPLE_MS = 100;
 const unsigned long FAILSAFE_MS = 3000;
+
+// ── start-up kick (static friction) ─────────────────────────────────────
+// From standstill the PID's minimum output (40) can't break the belt loose, so the belt sat still
+// while the integral wound up, then lurched. Instead: full-ish PWM for KICK_MS, then the PID takes
+// over starting from RUN_START_PWM. If the belt stalls again (no pulse for 400 ms) it re-kicks.
+const int KICK_PWM = 180;
+const unsigned long KICK_MS = 150;
+const int RUN_START_PWM = 70;                 // tune: lowest PWM that keeps the belt moving once started
+const unsigned long REKICK_MS = 1000;         // min time between kicks
 
 // ── encoder: pulse-interval buffer ───────────────────────────────────────
 #define NUM_INTERVALS 4
@@ -95,6 +105,8 @@ const float DIST_DETECT_THRESHOLD_CM = 55.0;
 
 unsigned long lastSample = 0, lastRx = 0;
 bool hostLinked = false;                      // true once the PC app has sent a keep-alive
+bool kicking = false;
+unsigned long kickStart = 0;
 
 void driveForward() {                         // same polarity as the validated sketch
   digitalWrite(IN2, HIGH);
@@ -121,6 +133,8 @@ void stopMotor() {
   output = 0;
   analogWrite(ENA, 0);
   rpmFiltered = 0;
+  kicking = false;
+  kickStart = millis() - REKICK_MS;           // next start kicks immediately
 }
 
 #if ULTRASONIC
@@ -249,7 +263,19 @@ void loop() {
   setpoint = MAX_RPM * speedPct / 100.0;
   if (motorOn) {
     input = rpmFiltered;
-    pid.Compute();
+    bool stalled = sinceLastPulse > STOP_TIMEOUT_US;
+    if (kicking && millis() - kickStart >= KICK_MS) {   // kick over: hand over to the PID
+      kicking = false;
+      output = RUN_START_PWM;
+      pid.SetMode(MANUAL);
+      pid.SetMode(AUTOMATIC);                           // re-initialises the PID's integral from output
+    }
+    if (!kicking && stalled && millis() - kickStart >= REKICK_MS) {
+      kicking = true;
+      kickStart = millis();
+    }
+    if (kicking) output = KICK_PWM;
+    else pid.Compute();
     analogWrite(ENA, (int)output);
   } else {
     output = 0;
