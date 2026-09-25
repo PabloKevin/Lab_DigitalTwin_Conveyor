@@ -100,11 +100,9 @@ body {
 
 /* segmented radio */
 .seg { display: inline-flex; border: 1px solid var(--ink); border-radius: 6px; overflow: hidden; background: #fff; }
-.seg-l { position: relative; padding: 6px 14px; cursor: pointer; border-left: 1px solid var(--line); user-select: none; }
+.seg-l { padding: 6px 14px; cursor: pointer; border-left: 1px solid var(--line); user-select: none; }
 .seg-l:first-child { border-left: 0; }
-/* inset:0 makes the real (invisible) radio input exactly cover its label, so clicks land on the input
-   itself directly - relying on label-wraps-input click forwarding alone was not reliable here. */
-.seg-i { position: absolute; inset: 0; margin: 0; opacity: 0; cursor: pointer; }
+.seg-i { position: absolute; opacity: 0; pointer-events: none; }
 .seg-l:has(.seg-i:checked) { background: var(--ink); color: #fff; }
 .seg-l:has(.seg-i:focus-visible) { outline: 3px solid #9ab8e6; outline-offset: -3px; }
 
