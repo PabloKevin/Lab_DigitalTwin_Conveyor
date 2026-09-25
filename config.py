@@ -57,7 +57,7 @@ SERIAL = dict(
 # ════════════════════════════════════════════════════════════════════════════
 BELT_LENGTH_CM = 68.0
 ROLLER_RADIUS_CM = 1.30     # drive roller radius (lab guide: r = 5 cm)
-MAX_RPM = 200.0            # RPM at 100 % speed - must match MAX_RPM in arduino_uno_conveyor.ino
+MAX_RPM = 300.0            # RPM at 100 % speed - must match MAX_RPM in arduino_uno_conveyor.ino
 ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 
 # Physical ground-truth reference glued/taped onto the belt, used to check and fine-tune the
