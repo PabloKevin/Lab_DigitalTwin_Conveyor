@@ -66,7 +66,7 @@ ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 #   - width_cm:   horizontal width of the mark
 # vision.py draws this as a yellow reference on the camera overlay; nudge roi_x1/roi_x2 (Camera
 # calibration controls) until the yellow mark lines up with the real mark in the image.
-CALIBRATION_MARK = dict(x_start_cm=28.7, width_cm=4.0)
+CALIBRATION_MARK = dict(x_start_cm=28.7, width_cm=3.90)
 
 # HC-SR04 ultrasonic sensor (wired to the Arduino), looking along the belt at the objects on it.
 # Belt position of the object = sensor_x_cm + facing * distance (+ facing * object_half_len_cm).
@@ -128,7 +128,9 @@ VISION = dict(
     # Use CALIBRATION_MARK below (the red square on the belt) as a ground-truth reference while tuning roi_x1/roi_x2:
     # its expected pixel position is drawn on the camera overlay as a yellow marker - move the ROI sliders until
     # the yellow mark lines up with the real red square in the image.
-    belt_roi_px=(10, 10, 630, 150),
+    # Calibrated on the real belt with the crop OFF (full 640x480 frame): 680 px = 68 cm -> 10 px/cm.
+    # x2 = 680 is past the frame edge on purpose - it sets the scale, the belt's last cm are just out of view.
+    belt_roi_px=(5, 125, 320, 175),
     flip_x=False,          # True if the camera sees the belt mirrored (forward = towards the left)
     speed_window_s=1.0,    # window used to fit each object's speed
     lost_after_s=1.5,      # forget a track not seen for this long
@@ -138,6 +140,38 @@ VISION = dict(
     sim_spawn_every_s=6.0,
     sim_slip=1.0,          # 1.0 = objects move with the belt; 0.8 = they slip (creates a divergence)
 )
+
+# ════════════════════════════════════════════════════════════════════════════
+# DETECTION FILTERS  (vision.py -> classify / BgSubVision._detect / VisionBase.process)
+#   Every blob that background subtraction finds is measured:
+#     w_cm    width along the belt            h_frac  height / belt band height (1.0 = whole belt)
+#     fill    blob area / bounding box area (circle ~0.8, rectangle ~1.0, reflections usually low)
+#     hue     mean OpenCV hue 0..180 (orange ~5-25)   sat / val  mean saturation / brightness 0..255
+#   Turn "Show blob measurements" on (page, "Detection filters") to see these numbers on the video and
+#   tune the ranges below. Rejected blobs are drawn in magenta with the reason. Each filter has its own
+#   on/off switch on the page (defaults = "on" here); to remove one for good, delete its entry here,
+#   its switch in CONTROLS and its few lines in vision.py (search for its name).
+# ════════════════════════════════════════════════════════════════════════════
+DETECTION_FILTERS = dict(
+    # the belt's own white seam: ~2 cm wide, spans the whole belt height
+    belt_line=dict(on=True, w_cm=(1.0, 3.5), min_h_frac=0.75),
+    # drop blobs that match no OBJECT_CLASSES entry (reflections, hands, noise)
+    known_only=dict(on=True),
+    # a blob must be detected in this many detection frames in a row before it is shown (reflections flicker)
+    persistence=dict(on=True, min_hits=3),
+    # drop tracks that stay in place while the belt moves (a fixed glare spot). OFF by default: it would also
+    # hide a real object that is stuck/blocked - exactly what the "Object position" divergence should catch.
+    static=dict(on=False, belt_travel_cm=4.0, max_move_cm=1.0),
+    # print the measurements of every blob on the video (for tuning)
+    debug=dict(on=True),
+)
+
+# The objects that are really put on the belt. A blob gets the label of the FIRST class whose ranges all
+# contain its measurements (keys you leave out are not checked). Add a dict here to recognise a new object.
+OBJECT_CLASSES = [
+    dict(label="orange cilinder", w_cm=(2.0, 5.0), h_frac=(0.10, 0.5), fill=(0.1, 1.0), hue=(0, 50), sat=(0, 255)),
+    dict(label="metal box", w_cm=(5.0, 16.0), h_frac=(0.5, 1.0), fill=(0.5, 1.0), hue=(0, 180), sat=(0, 200)),
+]
 
 # ════════════════════════════════════════════════════════════════════════════
 # VARIABLES
@@ -183,6 +217,7 @@ VARIABLES = [
     # --- from the camera (vision.py) ----------------------------------------
     dict(id="cam_belt_speed_cm_s", label="Belt speed (camera)", unit="cm/s", source="vision", fmt="{:.1f}", color="#7a3fb0"),
     dict(id="cam_objects", label="Objects on belt", source="vision", fmt="{:.0f}"),
+    dict(id="cam_rejected", label="Blobs rejected by filters", source="vision", fmt="{:.0f}"),
     dict(id="cam_fps", label="Vision rate", unit="fps", source="vision", fmt="{:.1f}"),
     dict(id="cam_lag_ms", label="Camera delay (above minimum)", unit="ms", source="vision", fmt="{:.0f}",
          warn=(None, 300), alarm=(None, 800)),
@@ -193,7 +228,7 @@ VARIABLES = [
 # ════════════════════════════════════════════════════════════════════════════
 PANELS = [
     dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "speed_ack", "belt_speed_cm_s"]),
-    dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_fps", "cam_lag_ms"]),
+    dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_rejected", "cam_fps", "cam_lag_ms"]),
     dict(title="Ultrasonic", vars=["us_distance_cm", "us_x_cm", "us_obj_speed_cm_s"]),
     dict(title="Twin model", vars=["model_rpm", "model_belt_speed_cm_s"]),
 ]
@@ -247,7 +282,7 @@ CONTROLS = [
     # Camera calibration - changes take effect immediately, watch the overlay in the camera window:
     dict(id="roi_x1", group="Camera calibration", label="Belt start x (px)  = 0 cm", kind="number", step=5, default=_R[0],
          target="twin", model_var="roi_x1"),
-    dict(id="roi_x2", group="Camera calibration", label="Belt end x (px)  = 60 cm", kind="number", step=5, default=_R[2],
+    dict(id="roi_x2", group="Camera calibration", label=f"Belt end x (px)  = {BELT_LENGTH_CM:g} cm", kind="number", step=5, default=_R[2],
          target="twin", model_var="roi_x2"),
     dict(id="roi_y1", group="Camera calibration", label="Belt top y (px)", kind="number", step=5, default=_R[1],
          target="twin", model_var="roi_y1"),
@@ -255,6 +290,19 @@ CONTROLS = [
          target="twin", model_var="roi_y2"),
     dict(id="flip_x", group="Camera calibration", label="Mirror image", kind="switch", default=VISION["flip_x"],
          target="twin", model_var="flip_x"),
+
+    # Detection filters (see DETECTION_FILTERS) - flip them live to see what each one does:
+    dict(id="filt_belt_line", group="Detection filters", label="Ignore the belt's white line", kind="switch",
+         default=DETECTION_FILTERS["belt_line"]["on"], target="twin", model_var="filt_belt_line"),
+    dict(id="filt_known_only", group="Detection filters", label="Only ball / box (drop reflections)", kind="switch",
+         default=DETECTION_FILTERS["known_only"]["on"], target="twin", model_var="filt_known_only"),
+    dict(id="filt_persistence", group="Detection filters",
+         label=f"Must be seen {DETECTION_FILTERS['persistence']['min_hits']} frames in a row", kind="switch",
+         default=DETECTION_FILTERS["persistence"]["on"], target="twin", model_var="filt_persistence"),
+    dict(id="filt_static", group="Detection filters", label="Drop blobs not moving with the belt", kind="switch",
+         default=DETECTION_FILTERS["static"]["on"], target="twin", model_var="filt_static"),
+    dict(id="filt_debug", group="Detection filters", label="Show blob measurements on video", kind="switch",
+         default=DETECTION_FILTERS["debug"]["on"], target="twin", model_var="filt_debug"),
 
     # ESP32-CAM settings: sent as  http://<camera>/control?var=<camera_var>&val=<int>  (see the camera firmware).
     # They apply on the camera immediately. The defaults below mirror what the firmware sets at boot.

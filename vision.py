@@ -58,6 +58,43 @@ def cm_to_px(cm):
     return x1 + frac * (x2 - x1)
 
 
+# ── detection filters (config.DETECTION_FILTERS / OBJECT_CLASSES) ─────────────────────────────
+F = cfg.DETECTION_FILTERS
+
+
+def filt_on(name):
+    """Live on/off switch of a filter (page "Detection filters"), defaulting to config."""
+    return bool(state.params.get(f"filt_{name}", F[name]["on"]))
+
+
+def blob_features(hsv, contour, area, bw, bh, px_per_cm, band_h):
+    m = np.zeros(hsv.shape[:2], np.uint8)
+    cv2.drawContours(m, [contour], -1, 255, -1)
+    h, s, v, _ = cv2.mean(hsv, mask=m)
+    return dict(w_cm=bw / px_per_cm, h_frac=bh / max(1, band_h), fill=area / max(1, bw * bh), hue=h, sat=s, val=v)
+
+
+def _in(x, rng):
+    return rng[0] <= x <= rng[1]
+
+
+def classify(f):
+    """-> (label, None) for an object we want, or (None, reason) for a rejected blob."""
+    bl = F["belt_line"]
+    if filt_on("belt_line") and _in(f["w_cm"], bl["w_cm"]) and f["h_frac"] >= bl["min_h_frac"]:
+        return None, "belt line"
+    for oc in cfg.OBJECT_CLASSES:
+        if all(_in(f[k], rng) for k, rng in oc.items() if k != "label"):
+            return oc["label"], None
+    if filt_on("known_only"):
+        return None, "unknown"
+    return "object", None
+
+
+def feature_text(f):
+    return f"w{f['w_cm']:.1f} h{f['h_frac'] * 100:.0f}% f{f['fill']:.2f} H{f['hue']:.0f} S{f['sat']:.0f} V{f['val']:.0f}"
+
+
 # ── placeholder + overlay ───────────────────────────────────────────────────────────────
 def placeholder_jpeg(text):
     img = np.full((360, 640, 3), (236, 239, 243), np.uint8)
@@ -65,7 +102,7 @@ def placeholder_jpeg(text):
     return cv2.imencode(".jpg", img)[1].tobytes()
 
 
-def draw_overlay(img, objs):
+def draw_overlay(img, objs, blobs=()):
     x1, y1, x2, y2 = [int(v) for v in roi()]
     cv2.rectangle(img, (x1, y1), (x2, y2), (200, 140, 20), 1)
     for cm in range(0, int(L) + 1, 10):
@@ -82,6 +119,19 @@ def draw_overlay(img, objs):
     for px in (mx1, mx2):
         cv2.line(img, (px, y1), (px, y2), (255, 210, 0), 1, cv2.LINE_4)
     cv2.putText(img, "ref mark", (min(mx1, mx2), my - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 210, 0), 1, cv2.LINE_AA)
+
+    # blobs of the last detection: rejected ones in magenta with the reason, measurements if debug is on
+    debug = filt_on("debug")
+    for i, b in enumerate(blobs):
+        bx1, by1, bx2, by2 = [int(v) for v in b["box"]]
+        if b.get("why"):
+            cv2.rectangle(img, (bx1, by1), (bx2, by2), (200, 0, 200), 1)
+            cv2.putText(img, "x " + b["why"], (bx1, by2 + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 0, 200), 1, cv2.LINE_AA)
+        if debug and b.get("f"):                     # outlined so it reads on any background
+            org, txt = (bx1, by2 + 26 + 12 * (i % 3)), feature_text(b["f"])
+            cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, txt, org, cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                        (255, 120, 255) if b.get("why") else (120, 255, 120), 1, cv2.LINE_AA)
 
     for o in objs:
         bx1, by1, bx2, by2 = [int(v) for v in o["box"]]
@@ -127,7 +177,8 @@ class TrackBook:
             expected = tr["x0"] + (travel - tr["travel0"])
             err = (tr["x"] - expected) if (age >= 0.5 and 0 <= expected <= L) else None
             out.append(dict(id=tr["id"], label=tr["label"], x_cm=tr["x"], speed_cm_s=speed, expected_cm=expected,
-                            err_cm=err, conf=tr["conf"], age_s=age, box=tr["box"], diverging=False))
+                            err_cm=err, conf=tr["conf"], age_s=age, box=tr["box"], diverging=False,
+                            moved_cm=tr["x"] - tr["x0"], belt_moved_cm=travel - tr["travel0"]))
         return out
 
 
@@ -138,6 +189,7 @@ class VisionBase(threading.Thread):
         self.book = TrackBook()
         self._stamps = deque(maxlen=15)
         self._last_pub = 0.0
+        self.blobs = []                              # last detection's blobs, for the overlay (see draw_overlay)
 
     def run(self):
         try:
@@ -150,6 +202,15 @@ class VisionBase(threading.Thread):
 
     def process(self, dets, t):
         objs = self.book.update(dets, t)
+        if filt_on("static"):                        # fixed glare spot: stays put while the belt moves under it
+            st, keep = F["static"], []
+            for o in objs:
+                if abs(o["belt_moved_cm"]) >= st["belt_travel_cm"] and abs(o["moved_cm"]) < st["max_move_cm"]:
+                    self.blobs.append(dict(box=o["box"], why="static"))
+                else:
+                    keep.append(o)
+            objs = keep
+        state.set_value("cam_rejected", sum(1 for b in self.blobs if b.get("why")))
         state.objects = objs
         state.set_value("cam_objects", len(objs))
 
@@ -170,9 +231,8 @@ class VisionBase(threading.Thread):
             self.bridge.publish(V["publish_topic"], json.dumps(payload), qos=0, quiet=True)
         return objs
 
-    @staticmethod
-    def show(frame, objs):
-        frame = draw_overlay(frame, objs)
+    def show(self, frame, objs):
+        frame = draw_overlay(frame, objs, self.blobs)
         if frame.shape[1] > 800:
             s = 800.0 / frame.shape[1]
             frame = cv2.resize(frame, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
@@ -279,6 +339,7 @@ class CentroidTracker:
         self.next_id = 1
         self.objects = {}      # id -> box (bx1, by1, bx2, by2)
         self.missed = {}       # id -> consecutive frames without a match
+        self.hits = {}         # id -> consecutive frames WITH a match (persistence filter)
 
     @staticmethod
     def _centroid(box):
@@ -288,9 +349,11 @@ class CentroidTracker:
     def _drop_stale(self, ids):
         for tid in ids:
             self.missed[tid] += 1
+            self.hits[tid] = 0
             if self.missed[tid] > self.max_missed:
                 del self.objects[tid]
                 del self.missed[tid]
+                del self.hits[tid]
 
     def update(self, boxes):
         if not boxes:
@@ -298,7 +361,7 @@ class CentroidTracker:
             return dict(self.objects)
         if not self.objects:
             for box in boxes:
-                self.objects[self.next_id], self.missed[self.next_id] = box, 0
+                self.objects[self.next_id], self.missed[self.next_id], self.hits[self.next_id] = box, 0, 1
                 self.next_id += 1
             return dict(self.objects)
 
@@ -313,13 +376,14 @@ class CentroidTracker:
                 continue                                    # closest pairs first, greedy matching
             tid = ids[r]
             self.objects[tid], self.missed[tid] = boxes[c], 0
+            self.hits[tid] += 1
             used_rows.add(r)
             used_cols.add(c)
 
         self._drop_stale([ids[r] for r in range(len(ids)) if r not in used_rows])
         for c, box in enumerate(boxes):
             if c not in used_cols:
-                self.objects[self.next_id], self.missed[self.next_id] = box, 0
+                self.objects[self.next_id], self.missed[self.next_id], self.hits[self.next_id] = box, 0, 1
                 self.next_id += 1
         return dict(self.objects)
 
@@ -333,6 +397,7 @@ class BgSubVision(VisionBase):
         backsub = cv2.createBackgroundSubtractorMOG2(
             history=V["bg_history"], varThreshold=V["bg_var_threshold"], detectShadows=True)
         tracker = CentroidTracker(max_missed=V["track_max_missed"], max_dist_px=V["track_max_dist_px"])
+        self.track_labels, self.confirmed = {}, set()   # tid -> class label; tids that passed the persistence filter
         kernel = np.ones((5, 5), np.uint8)
 
         last_seq, last_det, last_frame_t = 0, 0.0, time.time()
@@ -358,10 +423,10 @@ class BgSubVision(VisionBase):
                 objs = self.process(dets, t)
             self.show(frame, objs)
 
-    @staticmethod
-    def _detect(frame, backsub, tracker, kernel):
+    def _detect(self, frame, backsub, tracker, kernel):
         x1, y1, x2, y2 = [int(v) for v in roi()]
         belt = frame[y1:y2, x1:x2]
+        self.blobs = []
         if belt.size == 0:
             return []
 
@@ -371,17 +436,34 @@ class BgSubVision(VisionBase):
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)   # fill holes inside blobs
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        boxes = []
+        hsv = cv2.cvtColor(belt, cv2.COLOR_BGR2HSV)
+        px_per_cm = max(1.0, x2 - x1) / L
+        boxes, labels = [], {}
         for c in contours:
             area = cv2.contourArea(c)
             if V["min_area_px"] <= area <= V["max_area_px"]:
                 bx, by, bw, bh = cv2.boundingRect(c)
-                boxes.append((bx + x1, by + y1, bx + x1 + bw, by + y1 + bh))    # back to full-frame coords
+                box = (bx + x1, by + y1, bx + x1 + bw, by + y1 + bh)             # back to full-frame coords
+                f = blob_features(hsv, c, area, bw, bh, px_per_cm, belt.shape[0])
+                label, why = classify(f)
+                self.blobs.append(dict(box=box, f=f, why=why))
+                if label is not None:                                          # rejected blobs never become tracks
+                    boxes.append(box)
+                    labels[box] = label
 
+        tracks = tracker.update(boxes)
+        self.track_labels = {tid: labels.get(box, self.track_labels.get(tid, "object"))
+                             for tid, box in tracks.items()}
         dets = []
-        for tid, (bx1, by1, bx2, by2) in tracker.update(boxes).items():
-            dets.append(dict(tid=tid, label="object", x_cm=float(px_to_cm((bx1 + bx2) / 2)),
+        for tid, (bx1, by1, bx2, by2) in tracks.items():
+            if filt_on("persistence") and tracker.hits.get(tid, 0) < F["persistence"]["min_hits"] \
+                    and tid not in self.confirmed:
+                self.blobs.append(dict(box=(bx1, by1, bx2, by2), why="new"))
+                continue
+            self.confirmed.add(tid)
+            dets.append(dict(tid=tid, label=self.track_labels[tid], x_cm=float(px_to_cm((bx1 + bx2) / 2)),
                               conf=1.0, box=(bx1, by1, bx2, by2)))
+        self.confirmed &= set(tracks)
         return dets
 
 
