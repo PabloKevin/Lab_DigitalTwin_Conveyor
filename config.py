@@ -186,6 +186,11 @@ CONTROLS = [
     # ESP32-CAM settings: sent as  http://<camera>/control?var=<camera_var>&val=<int>  (see the camera firmware).
     # They apply on the camera immediately. The defaults below mirror what the firmware sets at boot.
     # Moving belt tip: switch "Auto exposure" off and use a short manual exposure to reduce motion blur (add light!).
+    dict(id="cam_crop", group="Camera settings", label="Crop to belt band (low latency)", kind="switch", default=True,
+         target="camera", camera_var="crop"),
+    # ^ turn off to see the WHOLE frame the camera captures (e.g. to re-aim it or sanity-check calibration);
+    # the frame size changes when you flip this (640x160 cropped vs 640x480 full), so re-do the ROI below
+    # after toggling it, and set VISION["imgsz"] to match if you leave it off permanently.
     dict(id="cam_quality", group="Camera settings", label="JPEG quality (10 best … 63 smallest)", kind="slider",
          min=10, max=63, step=1, default=16, target="camera", camera_var="quality"),
     dict(id="cam_brightness", group="Camera settings", label="Brightness", kind="slider",

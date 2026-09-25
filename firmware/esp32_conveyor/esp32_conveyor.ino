@@ -75,7 +75,7 @@ void IRAM_ATTR encoderISR() {
 
 char dirCmd = 'S';
 float speedPct = 0;
-double kp = 2.0, ki = 0.5, kd = 0.1;
+double kp = 0.4, ki = 0.5, kd = 0.0;
 double pidSetpoint = 0, pidInput = 0, pidOutput = 0;
 PID pid(&pidInput, &pidOutput, &pidSetpoint, kp, ki, kd, DIRECT);
 int pwmOut = 0;
@@ -119,9 +119,14 @@ void onMessage(char* topic, byte* payload, unsigned int len) {
 }
 
 void connectMqtt() {
+  Serial.printf("MQTT: connecting to %s:%u ... ", MQTT_HOST, MQTT_PORT);
   if (mqtt.connect("esp32-conveyor", NULL, NULL, "conveyor/status", 1, true, "offline")) {
+    Serial.println("connected");
     mqtt.publish("conveyor/status", "online", true);
     mqtt.subscribe("conveyor/cmd/#");
+  } else {
+    // PubSubClient state(): -4 timeout, -3 lost, -2/-1 connect failed, 1..5 broker refused (bad proto/id/creds/unauthorized)
+    Serial.printf("failed, state=%d\n", mqtt.state());
   }
 }
 
@@ -154,7 +159,11 @@ void setup() {
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(IN1, OUTPUT);
   pinMode(IN2, OUTPUT);
-  ledcAttach(ENA, 20000, 8);
+  // The L298N is a bipolar (not MOSFET) H-bridge: its switching losses/saturation drop get much
+  // worse at high PWM frequency, so its effective output voltage collapses well before 20 kHz -
+  // even at duty=255 the motor barely turns. The Arduino UNO's analogWrite() runs at ~490-980 Hz,
+  // which is why the same wiring worked there; match that here instead of ESP32's usual 20 kHz default.
+  ledcAttach(ENA, 1000, 8);
   ledcWrite(ENA, 0);
   attachInterrupt(digitalPinToInterrupt(ENC_A), encoderISR, FALLING);
 
@@ -168,7 +177,11 @@ void setup() {
 
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.print("WiFi connected, IP: ");
   Serial.println(WiFi.localIP());
+  // Sanity check: the broker must be reachable on the SAME network as this IP above - if MQTT_HOST
+  // (secrets.h) is on a different subnet, "MQTT: connecting..." below will print "failed, state=-2/-4" forever.
+  Serial.printf("MQTT broker configured as: %s:%u\n", MQTT_HOST, MQTT_PORT);
   mqtt.setServer(MQTT_HOST, MQTT_PORT);
   mqtt.setCallback(onMessage);
 }

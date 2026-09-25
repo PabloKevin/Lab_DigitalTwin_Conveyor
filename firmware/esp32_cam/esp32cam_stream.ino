@@ -67,18 +67,27 @@ static const char* STREAM_PART         = "Content-Type: image/jpeg\r\nContent-Le
 httpd_handle_t web_httpd    = NULL;
 httpd_handle_t stream_httpd = NULL;
 
+// Runtime on/off for the crop, so it can be toggled from the web app (/control?var=crop&val=0|1)
+// without reflashing - handy to see the whole frame while aiming the camera / checking calibration,
+// then switch it back on for normal (low-latency) operation. Only has an effect when the camera was
+// initialised for raw capture (CROP_MIDDLE_THIRD == 1 at boot, see setup()); otherwise it's ignored.
+volatile bool cropEnabled = CROP_MIDDLE_THIRD;
+
 // Crops a raw RGB565 frame to its middle third (by rows) and JPEG-encodes just that band in
 // software. Raw rows are contiguous in memory, so the crop itself is just pointer arithmetic - no
 // copy needed. Returns true and fills *out/*out_len (caller must free(*out)) on success; false if
 // fb isn't a raw format we can crop (hardware JPEG, i.e. CROP_MIDDLE_THIRD off or no PSRAM) - the
-// caller should then send fb->buf/fb->len unmodified.
+// caller should then send fb->buf/fb->len unmodified. When cropEnabled is false the whole raw frame
+// is still (software) JPEG-encoded and sent, just not cropped - so the crop toggle can be flipped live.
 static bool cropAndEncode(camera_fb_t *fb, uint8_t **out, size_t *out_len) {
   if (fb->format != PIXFORMAT_RGB565) return false;
   const size_t bypp = 2;                     // bytes per pixel, RGB565
   camera_fb_t crop = *fb;                    // shallow copy: reuse width/format/timestamp
-  crop.height = fb->height / 3;
-  crop.buf    = fb->buf + crop.height * fb->width * bypp;   // skip the top third
-  crop.len    = crop.height * fb->width * bypp;
+  if (cropEnabled) {
+    crop.height = fb->height / 3;
+    crop.buf    = fb->buf + crop.height * fb->width * bypp;   // skip the top third
+    crop.len    = crop.height * fb->width * bypp;
+  }
   sensor_t *s = esp_camera_sensor_get();     // honour the live "JPEG quality" control (/control?var=quality)
   return frame2jpg(&crop, s ? s->status.quality : JPEG_QUALITY, out, out_len);
 }
@@ -176,6 +185,10 @@ static esp_err_t control_handler(httpd_req_t *req) {
     return ESP_FAIL;
   }
   int v = atoi(val);
+  if (!strcmp(var, "crop")) {
+    cropEnabled = v != 0;
+    return httpd_resp_send(req, "OK", HTTPD_RESP_USE_STRLEN);
+  }
   sensor_t *s = esp_camera_sensor_get();
   int r = -1;
   if      (!strcmp(var, "framesize"))     r = s->set_framesize(s, (framesize_t)v);
