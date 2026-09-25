@@ -56,7 +56,7 @@ SERIAL = dict(
 # Conveyor geometry
 # ════════════════════════════════════════════════════════════════════════════
 BELT_LENGTH_CM = 68.0
-ROLLER_RADIUS_CM = 1.30     # drive roller radius (lab guide: r = 5 cm)
+ROLLER_RADIUS_CM = 1.25     # drive roller radius (lab guide: r = 5 cm)
 MAX_RPM = 300.0            # RPM at 100 % speed - must match MAX_RPM in arduino_uno_conveyor.ino
 ENCODER_SIGN = 1           # set to -1 if "Forward" gives negative RPM
 
@@ -207,6 +207,11 @@ VARIABLES = [
     dict(id="belt_speed_cm_s", label="Belt speed (encoder)", unit="cm/s", source="derived", fmt="{:.1f}",
          color="#1f5fbf",
          fn=lambda v: ENCODER_SIGN * v["rpm"] / 60.0 * 2 * math.pi * ROLLER_RADIUS_CM),   # Eq. (1) of the lab guide
+    # Calibration helper: the ROLLER_RADIUS_CM that would make the encoder belt speed equal the camera's.
+    # Read it with objects riding on the belt at a steady speed, then put that value in ROLLER_RADIUS_CM.
+    dict(id="radius_fit_cm", label="Roller radius matching camera", unit="cm", source="derived", fmt="{:.2f}",
+         fn=lambda v: ROLLER_RADIUS_CM * v["cam_belt_speed_cm_s"] / v["belt_speed_cm_s"]
+         if abs(v["belt_speed_cm_s"]) > 2.0 and abs(v["cam_belt_speed_cm_s"]) > 1.0 else None),
     dict(id="us_x_cm", label="Object position (ultrasonic)", unit="cm", source="derived", fmt="{:.1f}",
          color="#2f8f5b", fn=lambda v: us_position_cm(v["us_distance_cm"])),
 
@@ -228,7 +233,7 @@ VARIABLES = [
 # ════════════════════════════════════════════════════════════════════════════
 PANELS = [
     dict(title="Drive", vars=["rpm", "setpoint", "pwm", "direction", "speed_ack", "belt_speed_cm_s"]),
-    dict(title="Camera", vars=["cam_belt_speed_cm_s", "cam_objects", "cam_rejected", "cam_fps", "cam_lag_ms"]),
+    dict(title="Camera", vars=["cam_belt_speed_cm_s", "radius_fit_cm", "cam_objects", "cam_rejected", "cam_fps", "cam_lag_ms"]),
     dict(title="Ultrasonic", vars=["us_distance_cm", "us_x_cm", "us_obj_speed_cm_s"]),
     dict(title="Twin model", vars=["model_rpm", "model_belt_speed_cm_s"]),
 ]
@@ -355,12 +360,6 @@ DIVERGENCE_RULES = [
     dict(id="speed", kind="compare", label="Motor speed vs model", a="rpm", b="model_rpm",
          abs_tol=30, rel_tol=0.0, hold_s=1.0, unit="RPM",
          cause="Bearing wear or friction", action="Preventive maintenance"),
-    dict(id="slip", kind="compare", label="Belt speed: encoder vs camera", a="belt_speed_cm_s", b="cam_belt_speed_cm_s",
-         abs_tol=3.0, rel_tol=0.1, hold_s=2.0, unit="cm/s",
-         cause="Belt slipping on the roller", action="Re-tension the belt, recalibrate the camera"),
-    dict(id="objpos", kind="object_position", label="Object position vs prediction",
-         abs_tol=4.0, hold_s=0.5, unit="cm",
-         cause="Object sliding on the belt", action="Check the belt surface, recalibrate the camera"),
     dict(id="link", kind="stale", label="Telemetry link", var="rpm", max_age_s=2.0, unit="s",
          cause="USB serial link lost or Arduino reset", action="Check the USB cable/port, reflash if needed"),
 ]

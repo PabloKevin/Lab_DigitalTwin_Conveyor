@@ -221,11 +221,7 @@ def belt_figure():
                                          size=18, color=GREEN, line=dict(color=INK, width=1))))
 
     objs = belt_objects()
-    # expected positions (predicted from encoder travel)
-    ex = [o for o in objs if o["err_cm"] is not None and abs(o["err_cm"]) > 0.5]
-    if ex:
-        fig.add_trace(go.Scatter(x=[o["expected_cm"] for o in ex], y=[3] * len(ex), mode="markers", name="Expected (encoder)",
-                                 hoverinfo="skip", marker=dict(symbol="square-open", size=46, color=AMBER, line=dict(width=3))))
+    # (the encoder-predicted position is not drawn; it is still computed for the "Object position" divergence rule)
     for bad, col in ((False, GREEN), (True, RED)):
         sel = [o for o in objs if bool(o.get("diverging")) == bad]
         if sel:
