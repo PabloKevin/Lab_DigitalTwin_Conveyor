@@ -3,7 +3,5 @@ plotly>=5.20
 paho-mqtt>=2.0
 pyserial>=3.5
 numpy
-opencv-python
-# Only needed when config.VISION["mode"] == "yolo" (pulls in PyTorch, ~1-2 GB):
-ultralytics>=8.3
+opencv-python-headless      # -headless: no GUI bindings/Qt needed on a headless board; swap for opencv-python if you want cv2.imshow elsewhere
 requests>=2.28

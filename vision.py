@@ -1,12 +1,16 @@
 """
-vision.py - camera -> objects on the belt (id, class, position in cm, speed in cm/s).
+vision.py - camera -> objects on the belt (id, position in cm, speed in cm/s).
 
 Modes (config.VISION["mode"]):
-  "yolo"  read the MJPEG stream of the ESP32-CAM, detect + track with Ultralytics YOLO
+  "bgsub" read the MJPEG stream of the ESP32-CAM, detect moving objects with background
+          subtraction (OpenCV MOG2) + contours, track them with a small centroid tracker.
+          No GPU/ML runtime needed - deliberately light enough for a Pi-class board (no CUDA,
+          no PyTorch). It only tells you THAT something moved and roughly its size, not what it
+          is (no class label) - fine for this twin, which only needs position/speed.
   "sim"   no camera: fake objects that ride on the measured belt speed (to test the twin)
   "off"   vision disabled
 
-Both modes feed the same pipeline (VisionBase.process), which
+All modes feed the same pipeline (VisionBase.process), which
   * converts pixels to belt centimetres using the calibrated ROI,
   * keeps a track per object and fits its speed,
   * predicts where the object should be from the ENCODER travel (used by the divergence rule),
@@ -175,7 +179,7 @@ class VisionBase(threading.Thread):
         state.jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])[1].tobytes()
 
 
-# ── real camera + YOLO ─────────────────────────────────────────────────────────────────
+# ── real camera + background subtraction ─────────────────────────────────────────────────
 def mjpeg_frames(resp):
     """Parse a multipart/x-mixed-replace stream by hand so the per-frame X-Timestamp header is available.
     Yields (jpeg_bytes, camera_timestamp_seconds_or_None)."""
@@ -263,21 +267,75 @@ class CameraReader(threading.Thread):
         cap.release()
 
 
-class YoloVision(VisionBase):
+class CentroidTracker:
+    """Assigns persistent ids to bounding boxes across frames by nearest-centroid matching (a
+    minimal version of the classic pyimagesearch centroid tracker). No GPU/ML involved: this is
+    what turns per-frame background-subtraction blobs into the same "track an id over time" shape
+    the rest of the pipeline (TrackBook) already expects from any detector."""
+
+    def __init__(self, max_missed, max_dist_px):
+        self.max_missed = max_missed
+        self.max_dist_px = max_dist_px
+        self.next_id = 1
+        self.objects = {}      # id -> box (bx1, by1, bx2, by2)
+        self.missed = {}       # id -> consecutive frames without a match
+
+    @staticmethod
+    def _centroid(box):
+        bx1, by1, bx2, by2 = box
+        return (bx1 + bx2) / 2, (by1 + by2) / 2
+
+    def _drop_stale(self, ids):
+        for tid in ids:
+            self.missed[tid] += 1
+            if self.missed[tid] > self.max_missed:
+                del self.objects[tid]
+                del self.missed[tid]
+
+    def update(self, boxes):
+        if not boxes:
+            self._drop_stale(list(self.missed))
+            return dict(self.objects)
+        if not self.objects:
+            for box in boxes:
+                self.objects[self.next_id], self.missed[self.next_id] = box, 0
+                self.next_id += 1
+            return dict(self.objects)
+
+        ids = list(self.objects)
+        prev_c = np.array([self._centroid(self.objects[i]) for i in ids])
+        new_c = np.array([self._centroid(b) for b in boxes])
+        dist = np.linalg.norm(prev_c[:, None, :] - new_c[None, :, :], axis=2)     # [prev, new]
+
+        used_rows, used_cols = set(), set()
+        for r, c in np.dstack(np.unravel_index(np.argsort(dist, axis=None), dist.shape))[0]:
+            if r in used_rows or c in used_cols or dist[r, c] > self.max_dist_px:
+                continue                                    # closest pairs first, greedy matching
+            tid = ids[r]
+            self.objects[tid], self.missed[tid] = boxes[c], 0
+            used_rows.add(r)
+            used_cols.add(c)
+
+        self._drop_stale([ids[r] for r in range(len(ids)) if r not in used_rows])
+        for c, box in enumerate(boxes):
+            if c not in used_cols:
+                self.objects[self.next_id], self.missed[self.next_id] = box, 0
+                self.next_id += 1
+        return dict(self.objects)
+
+
+class BgSubVision(VisionBase):
     def loop(self):
-        try:
-            from ultralytics import YOLO
-        except ImportError:
-            state.vision_status = "ultralytics not installed"
-            state.log("pip install ultralytics  (or set VISION['mode'] = 'sim' / 'off')", "alert")
-            return
-        state.vision_status = "loading model"
-        model = YOLO(V["model"])
         reader = CameraReader(V["camera_url"])
         reader.start()
         state.vision_status = f"connecting to {V['camera_url']}"
 
-        last_seq, last_inf, last_frame_t = 0, 0.0, time.time()
+        backsub = cv2.createBackgroundSubtractorMOG2(
+            history=V["bg_history"], varThreshold=V["bg_var_threshold"], detectShadows=True)
+        tracker = CentroidTracker(max_missed=V["track_max_missed"], max_dist_px=V["track_max_dist_px"])
+        kernel = np.ones((5, 5), np.uint8)
+
+        last_seq, last_frame_t = 0, time.time()
         objs = []
         while True:
             if reader.seq == last_seq:
@@ -290,26 +348,34 @@ class YoloVision(VisionBase):
             last_frame_t = time.time()
             state.vision_status = "streaming"
 
-            if time.time() - last_inf >= 1.0 / V["infer_fps"]:
-                last_inf = time.time()
-                res = model.track(frame, persist=True, tracker=V["tracker"], conf=V["conf"], imgsz=V["imgsz"],
-                                  classes=V["classes"], device=V["device"], verbose=False)[0]
-                objs = self.process(self._detections(res, model.names), t)
+            dets = self._detect(frame, backsub, tracker, kernel)
+            objs = self.process(dets, t)
             self.show(frame, objs)
 
     @staticmethod
-    def _detections(res, names):
-        boxes = res.boxes
-        if boxes is None or boxes.id is None:
+    def _detect(frame, backsub, tracker, kernel):
+        x1, y1, x2, y2 = [int(v) for v in roi()]
+        belt = frame[y1:y2, x1:x2]
+        if belt.size == 0:
             return []
-        x1, y1, x2, y2 = roi()
+
+        mask = backsub.apply(belt, learningRate=V["bg_learning_rate"])
+        mask[mask == 127] = 0                              # drop MOG2's "shadow" pixels, keep solid foreground only
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)    # remove speckle noise
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)   # fill holes inside blobs
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if V["min_area_px"] <= area <= V["max_area_px"]:
+                bx, by, bw, bh = cv2.boundingRect(c)
+                boxes.append((bx + x1, by + y1, bx + x1 + bw, by + y1 + bh))    # back to full-frame coords
+
         dets = []
-        for (bx1, by1, bx2, by2), tid, c, cf in zip(boxes.xyxy.cpu().numpy(), boxes.id.int().cpu().tolist(),
-                                                     boxes.cls.int().cpu().tolist(), boxes.conf.cpu().numpy()):
-            cx, cy = (bx1 + bx2) / 2, (by1 + by2) / 2
-            if not (x1 <= cx <= x2 and y1 <= cy <= y2):
-                continue                                   # outside the belt
-            dets.append(dict(tid=tid, label=names[c], x_cm=float(px_to_cm(cx)), conf=float(cf), box=(bx1, by1, bx2, by2)))
+        for tid, (bx1, by1, bx2, by2) in tracker.update(boxes).items():
+            dets.append(dict(tid=tid, label="object", x_cm=float(px_to_cm((bx1 + bx2) / 2)),
+                              conf=1.0, box=(bx1, by1, bx2, by2)))
         return dets
 
 
@@ -351,5 +417,5 @@ def start(bridge):
     if mode == "off":
         state.vision_status = "off"
         return
-    worker = SimVision(bridge) if mode == "sim" else YoloVision(bridge)
+    worker = SimVision(bridge) if mode == "sim" else BgSubVision(bridge)
     worker.start()

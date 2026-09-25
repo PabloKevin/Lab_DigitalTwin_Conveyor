@@ -1,23 +1,27 @@
-# Conveyor digital twin (Arduino UNO · pyserial · ESP32-CAM · MQTT · camera + YOLO · Dash)
+# Conveyor digital twin (Arduino UNO · pyserial · ESP32-CAM · background subtraction · Dash)
 
 A local web page that mirrors a 60 cm conveyor in real time, lets you change the real machine and the
-digital model from the same screen, and flags when physical and digital behaviour diverge.
+digital model from the same screen, and flags when physical and digital behaviour diverge. Runs fine
+on a small headless board (no GPU needed) - no PyTorch/YOLO anywhere in the stack.
 
 ```
  Arduino UNO (PID, encoder, XY-15AS) ──USB serial──►  app.py  ◄── browser (localhost:8050)
- ESP32-CAM ────────── HTTP MJPEG stream ─────────────►  vision.py (YOLO + tracking) ──MQTT──► Mosquitto (optional, outbound only)
+ ESP32-CAM ────────── HTTP MJPEG stream ─────────────►  vision.py (bg subtraction + tracking) ──MQTT──► Mosquitto (optional, outbound only)
 ```
 
 The conveyor (motor + encoder + PID) is driven by an Arduino UNO over a direct USB-serial link
 (`serial_bridge.py`) - an ESP32 was tried first but its H-bridge wiring didn't drive the motor
 reliably, see `firmware/esp32_conveyor/` if you want to revisit that path. The camera is unrelated
 to this and still an ESP32-CAM talking plain HTTP; MQTT/Mosquitto is now only used one-way, for
-`vision.py` to broadcast detected objects (nothing in this app reads that topic back).
+`vision.py` to broadcast detected objects (nothing in this app reads that topic back). Object
+detection is background subtraction (OpenCV MOG2) + contours, not a neural network - deliberately
+light enough to run on a Pi-class board (e.g. an Orange Pi with 4 GB RAM, no GPU); the trade-off is
+it can tell *something* moved and roughly how big it is, but not what it is (no class label).
 
 ## 1. Try it without hardware (5 minutes)
 
 ```bash
-pip install -r requirements.txt        # ultralytics is only needed for real YOLO vision
+pip install -r requirements.txt
 python sim_conveyor.py                 # terminal 1  fake conveyor over a virtual serial port
 # it prints a path like /dev/pts/4 - copy it into config.py's SERIAL["port"] (replacing "auto")
 # in config.py also set VISION["mode"] = "sim"   (fake objects riding the belt)
@@ -48,21 +52,23 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
    heartbeat even when unchanged, so a genuinely lost USB link is what trips this, not an idle UI).
 2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
    `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
-   (IP or `esp32cam.local`) and `VISION["mode"] = "yolo"`. If `.local` does not resolve on Ubuntu:
+   (IP or `esp32cam.local`) and `VISION["mode"] = "bgsub"`. If `.local` does not resolve on Ubuntu:
    `sudo apt install avahi-daemon libnss-mdns`, or just use the IP printed on the camera's serial monitor.
    By default the firmware (`CROP_MIDDLE_THIRD`) captures VGA (640x480) and crops to the middle third vertically before
    sending, since only the belt band is useful and this cuts WiFi latency a lot — so the frame the PC actually receives
-   is **640x160**. `VISION["imgsz"]` must match: `640` (default). Set `CROP_MIDDLE_THIRD 0` in the firmware to send full,
-   hardware-JPEG-encoded frames instead (less ESP32 CPU, more bytes over WiFi) — then use `imgsz=320`/`640` for QVGA/VGA
-   and re-do the ROI, since the frame height is no longer cropped.
+   is **640x160**. Set `CROP_MIDDLE_THIRD 0` in the firmware to send full, hardware-JPEG-encoded frames instead (less
+   ESP32 CPU, more bytes over WiFi) — then re-do the ROI, since the frame height is no longer cropped.
 3. **Geometry**: set `ROLLER_RADIUS_CM` and `MAX_RPM` for *your* drive. With the guide's numbers (r = 5 cm, 300 RPM) the belt runs
    94 cm/s at 100 %, so a 60 cm belt is crossed in under a second. Use the real gear ratio.
 4. **Calibrate the camera**: in *Camera calibration* type the pixel columns where the belt starts (= 0 cm) and ends (= 60 cm) and
    the top/bottom rows. The video shows the ROI, a ruler every 10 cm, and a yellow marker at `CALIBRATION_MARK` (a small
    physical mark measured by hand on the real belt, in `config.py`) — adjust the ROI sliders until that marker lines up
    with the real mark in the image. Use *Mirror image* if forward moves to the left.
-5. **Objects**: `yolo11n.pt` (COCO) only knows everyday classes. For your own objects, train a model (Ultralytics) and set
-   `VISION["model"] = "my_objects.pt"`. Use `VISION["classes"]` to filter.
+5. **Objects**: with the belt running empty, wait a few seconds after startup for `bg_history` frames to build the
+   background model, then place an object on the belt - it should get boxed on the camera overlay. If it's missed or
+   noise gets boxed instead, tune `min_area_px`/`max_area_px` (contour size filter, in pixels) and `bg_var_threshold`
+   (sensitivity) in `config.py`'s `VISION` dict while watching the overlay. There's no object classification (no
+   `"label"` beyond a generic `"object"`) since there's no neural network in this pipeline - only position/speed.
 
 ## 3. Serial protocol (conveyor) and MQTT (camera only)
 
@@ -139,7 +145,7 @@ New kinds go in `divergence._check()`.
 | `mqtt_bridge.py` | MQTT in/out (camera/vision object broadcasts only) |
 | `twin_model.py` | simulated conveyor, derived variables, belt travel, runs the rules |
 | `divergence.py` | rule engine |
-| `vision.py` | MJPEG reader, YOLO tracking, pixel→cm, speed, annotated video, simulated vision |
+| `vision.py` | MJPEG reader, background-subtraction + centroid tracking, pixel→cm, speed, annotated video, simulated vision |
 | `controls.py` | what happens when a widget changes |
 | `state.py` | shared thread-safe state |
 | `sim_conveyor.py` | fake Arduino for testing (virtual serial port) |
@@ -153,6 +159,8 @@ New kinds go in `divergence._check()`.
   least-delayed frames (`ClockSync`) and compares each frame with the encoder travel *at that moment*, so WiFi jitter does not
   create false divergences. The remaining constant delay (transport minimum) is not compensated; `Camera delay` shows the
   jitter on top of it. Timestamps are only used with the HTTP stream; videos/webcams use the PC clock.
-* Object speed comes from tracking the object's centre over ~1 s; very fast belts or low `infer_fps` make it noisy.
+* Object speed comes from tracking the object's centre over ~1 s; very fast belts or a slow camera frame rate make it noisy.
+* Background subtraction needs the belt empty and still for a few seconds after startup (or after `flip_x`/ROI/crop
+  changes) to relearn the background - an object already on the belt at startup may be missed until it moves away and back.
 * Run `python app.py` (not with Flask's reloader): the reloader would start every thread, the serial reader and the MQTT client twice.
 * Only one process can hold the Arduino's serial port at a time - close the Arduino IDE's Serial Monitor before running `app.py`.

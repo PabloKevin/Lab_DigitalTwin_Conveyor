@@ -300,7 +300,7 @@ def serve_layout():
     return html.Div(className="app", children=[
         html.Header(className="top", children=[
             html.Div(children=[html.H1("Conveyor digital twin"),
-                               html.P(f"{L:g} cm belt · Arduino over serial · camera + YOLO", className="sub")]),
+                               html.P(f"{L:g} cm belt · Arduino over serial · camera + bg subtraction", className="sub")]),
             html.Div(id="badges", className="badges"),
             html.Div(className="actions", children=[
                 dcc.RadioItems(id="sync", value="live" if state.sync else "sandbox", className="seg", labelClassName="seg-l",

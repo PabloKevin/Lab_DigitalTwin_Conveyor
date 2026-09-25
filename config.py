@@ -77,18 +77,20 @@ STALE_AFTER_S = 2.0        # a value older than this is shown as "—" / conside
 # Camera + vision
 # ════════════════════════════════════════════════════════════════════════════
 VISION = dict(
-    mode="yolo",           # "yolo" = real camera + YOLO | "sim" = fake objects (no camera) | "off"
+    mode="bgsub",           # "bgsub" = real camera + background subtraction | "sim" = fake objects (no camera) | "off"
     # ESP32-CAM firmware: stream on port 81, settings endpoint /control on port 80 (also accepts a video file or 0 = webcam).
     # If esp32cam.local does not resolve on Ubuntu use its IP (see the serial monitor) or: sudo apt install avahi-daemon libnss-mdns
     camera_url="http://esp32cam.local:81/stream",
     camera_control_url="http://esp32cam.local",
-    model="yolo11n.pt",    # any Ultralytics weights; use your own trained .pt for your objects
-    conf=0.35,
-    imgsz=640,             # match the camera frame size (see firmware: VGA 640 wide, cropped to the middle third vertically -> 640x160)
-    device=None,           # None = auto, "cpu", "cuda:0", "mps"
-    classes=None,          # e.g. [39, 41] to keep only some COCO classes; None = all
-    tracker="bytetrack.yaml",
-    infer_fps=10,          # max inferences per second
+    # Background subtraction (OpenCV MOG2) - no GPU/ML runtime, cheap enough for a Pi-class board.
+    # The belt must be empty and mostly static for a few seconds after startup so it can learn the background.
+    bg_history=500,          # frames used to build the background model
+    bg_var_threshold=25,     # MOG2 sensitivity: lower = more sensitive (more false positives from lighting flicker)
+    bg_learning_rate=-1,     # -1 = auto (~1/history); 0 = never adapt (background frozen after startup)
+    min_area_px=200,         # contour area filters, in pixels of the CAMERA FRAME - tune to your object size while
+    max_area_px=20000,       # watching the camera overlay (too low -> noise gets detected, too high -> misses the object)
+    track_max_dist_px=80,    # max centroid movement between frames to still count as the same object
+    track_max_missed=10,     # frames a track can go undetected before it's dropped
     # Region of the image that contains the belt (x1, y1, x2, y2) in pixels OF THE CAMERA FRAME.
     # x1 -> 0 cm and x2 -> BELT_LENGTH_CM. Tune it live in the "Camera calibration" controls.
     # Defaults are for the firmware's cropped frame: 640x160 (VGA 640x480, middle third kept, see esp32cam_stream.ino).
@@ -217,7 +219,7 @@ CONTROLS = [
          target="camera", camera_var="crop"),
     # ^ turn off to see the WHOLE frame the camera captures (e.g. to re-aim it or sanity-check calibration);
     # the frame size changes when you flip this (640x160 cropped vs 640x480 full), so re-do the ROI below
-    # after toggling it, and set VISION["imgsz"] to match if you leave it off permanently.
+    # after toggling it - the background model also needs a moment to relearn at the new frame size.
     dict(id="cam_quality", group="Camera settings", label="JPEG quality (10 best … 63 smallest)", kind="slider",
          min=10, max=63, step=1, default=16, target="camera", camera_var="quality"),
     dict(id="cam_brightness", group="Camera settings", label="Brightness", kind="slider",
