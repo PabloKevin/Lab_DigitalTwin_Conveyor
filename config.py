@@ -90,6 +90,8 @@ VISION = dict(
     camera_control_url="http://10.82.234.15",
     # Background subtraction (OpenCV MOG2) - no GPU/ML runtime, cheap enough for a Pi-class board.
     # The belt must be empty and mostly static for a few seconds after startup so it can learn the background.
+    process_fps=8,           # max detections per second - the video itself is still shown at full camera
+                             # rate (see BgSubVision.loop); lower this first if the OrangePi's CPU can't keep up
     bg_history=500,          # frames used to build the background model
     bg_var_threshold=25,     # MOG2 sensitivity: lower = more sensitive (more false positives from lighting flicker)
     bg_learning_rate=-1,     # -1 = auto (~1/history); 0 = never adapt (background frozen after startup)

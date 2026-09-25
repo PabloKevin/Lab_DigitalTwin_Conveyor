@@ -335,7 +335,7 @@ class BgSubVision(VisionBase):
         tracker = CentroidTracker(max_missed=V["track_max_missed"], max_dist_px=V["track_max_dist_px"])
         kernel = np.ones((5, 5), np.uint8)
 
-        last_seq, last_frame_t = 0, time.time()
+        last_seq, last_det, last_frame_t = 0, 0.0, time.time()
         objs = []
         while True:
             if reader.seq == last_seq:
@@ -348,8 +348,14 @@ class BgSubVision(VisionBase):
             last_frame_t = time.time()
             state.vision_status = "streaming"
 
-            dets = self._detect(frame, backsub, tracker, kernel)
-            objs = self.process(dets, t)
+            # Detection (background subtraction + contours + tracking) is the CPU-heavy part - throttle it
+            # to process_fps on a weak/no-GPU board. The video itself is still shown at the camera's full
+            # delivered rate below, reusing the last detection result, so the displayed feed stays smooth
+            # even when detection can't keep up with every frame.
+            if time.time() - last_det >= 1.0 / V["process_fps"]:
+                last_det = time.time()
+                dets = self._detect(frame, backsub, tracker, kernel)
+                objs = self.process(dets, t)
             self.show(frame, objs)
 
     @staticmethod
