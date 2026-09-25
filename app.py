@@ -396,7 +396,11 @@ def main():
     print(f"\n  Digital twin running at {url}\n")
     if cfg.WEB.get("open_browser"):
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
-    app.run(host=cfg.WEB["host"], port=cfg.WEB["port"], debug=False)   # debug=False: the reloader would start every thread twice
+    # threaded=True: /video_feed is an infinite streaming connection: without this, Flask's dev server
+    # (single request at a time by default) gets stuck serving it and everything else - the periodic
+    # belt/panels updates included - queues behind it forever.
+    # debug=False: the reloader would start every thread (serial reader, MQTT client, vision) twice.
+    app.run(host=cfg.WEB["host"], port=cfg.WEB["port"], debug=False, threaded=True)
 
 
 if __name__ == "__main__":
