@@ -1,0 +1,9 @@
+# Lab 03 classifier - training / dataset tools (NOT needed on the Orange Pi running app.py).
+# Already satisfied by the existing conda env "Control" (versions it has):
+tensorflow==2.20.*          # Keras 3 model + tf.lite.TFLiteConverter (full-int8 export)
+keras==3.13.*
+opencv-python>=4.10         # with GUI (capture.py window); 4.12 in "Control"
+numpy>=2.1
+scikit-learn>=1.5           # metrics (macro-F1, confusion matrix)
+matplotlib>=3.9
+requests>=2.28

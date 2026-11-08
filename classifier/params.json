@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "image": {
+    "downsample": 2,
+    "window": null
+  },
+  "edges": {
+    "chroma_gain": 1.5,
+    "mode": "fixed",
+    "lo": 40,
+    "hi": 100,
+    "hi_percentile": 92,
+    "lo_ratio": 0.45,
+    "min_edge_px": 12
+  },
+  "mask": {
+    "close_r": 4
+  },
+  "blob": {
+    "min_area_px": 120,
+    "max_area_px": 9000,
+    "min_fill": 0.35,
+    "max_aspect": 6.0,
+    "edge_margin_px": 2,
+    "seam_max_w_px": 18,
+    "seam_min_h_frac": 0.75
+  },
+  "crop": {
+    "px_per_cm": 10.0,
+    "input_size": 64,
+    "scale_k": 2,
+    "fill_bgr": [128, 128, 128]
+  },
+  "model": {
+    "classes": ["class_a", "class_b", "class_c", "other"]
+  },
+  "decision": {
+    "n_frames": 5,
+    "min_agree": 4,
+    "tau": 0.70
+  },
+  "destinations": {
+    "class_a": "servo_1",
+    "class_b": "servo_2",
+    "class_c": "belt_end",
+    "other": "belt_end",
+    "dudoso": "belt_end"
+  }
+}
