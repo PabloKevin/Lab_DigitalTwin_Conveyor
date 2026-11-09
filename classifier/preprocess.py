@@ -1,20 +1,27 @@
 """
-classifier/preprocess.py - object segmentation + model input, shared by dataset capture, training and
-(ported 1:1 to C++) the ESP32-CAM firmware.
+classifier/preprocess.py - find the cube face (a square) and turn it into the model input. Shared by dataset
+capture, augmentation, training and (ported 1:1 to C++) the ESP32-CAM firmware.
 
 Pipeline (all parameters in classifier/params.json):
-  band (cut frame, e.g. 640x160)  ->  optional window  ->  downsample x2 (block mean)
+  frame / cut band -> optional window -> downsample (block mean)
   -> 3 channels: Y = (R+2G+B)/4, RG = R-G, BY = B-(R+G)/2      (chroma catches colour-only edges)
   -> 5x5 binomial blur -> Sobel per channel, L1 magnitude, chroma scaled by chroma_gain
   -> per pixel keep the channel with the strongest gradient -> non-max suppression
   -> hysteresis (lo/hi) + drop edge fragments shorter than min_edge_px  (belt texture, glare)
   -> dilate(close_r) -> fill holes (top/bottom-seeded) -> erode(close_r) (edges -> solid mask)
-  -> connected components; reject belt seam / too small / too big / too sparse / too elongated
-  -> keep the largest valid blob; status "partial" if it touches the window's left/right edge
-  -> crop a square of input_size*k px around it (fixed px/cm scale), pixels outside the mask -> fill
-  -> k x k block mean -> input_size x input_size BGR
+  -> open(open_r): erase 1-px edge lines that were never closed (they also glue objects together)
+  -> connected components -> rotated bounding rectangle (min-area rect) of each one
+  -> SQUARE FILTER: sides ratio <= max_side_ratio, area / rect area >= min_rect_fill, side within side_cm,
+     and the 4 corner probes (corner_probe_frac inside each corner) on the object
+     (rejects rectangles, discs, strips, hands...). Blobs touching the left/right edge -> "partial".
+  -> FRAGMENT MERGING: pieces (strips, stickers, crosses, small squares) that are close and aligned are grouped;
+     the group's convex hull is tested as a square too (a face whose stickers partly have no edge against the
+     background: stripes -> 2 strips, corners on a dark background -> 4 corner stickers). Largest square wins.
+  -> largest square -> its 4 corners (shrunk by inset_frac) -> affine warp of the FULL-RES image
+     -> upright input_size x input_size face (no background, no rotation; 90-degree ambiguity is irrelevant
+        for the classes and covered by augmentation)
 
-Everything up to the crop is integer arithmetic on purpose, so the C++ port can reproduce it exactly.
+Everything up to the components is integer arithmetic on purpose, so the C++ port can reproduce it exactly.
 Images are BGR uint8 (OpenCV convention); the model input order is converted to RGB in training/export.
 
 CLI (from the repo root, conda env "Control"):
@@ -47,13 +54,14 @@ def save_params(p, path=PARAMS_PATH):
 class Detection:
     status: str                        # "ok" | "partial" (touches window edge) | "none"
     reason: str = ""                   # why "none" (for the overlay)
-    bbox: tuple = None                 # (x1, y1, x2, y2) in full-image px, x2/y2 exclusive
+    bbox: tuple = None                 # axis-aligned (x1, y1, x2, y2) in full-image px, x2/y2 exclusive
+    corners: np.ndarray = None         # 4x2 float32 face corners in full-image px (tl, tr, br, bl), shrunk by inset
+    angle: float = 0.0                 # rotation of the face, degrees in [0, 90)
     mask: np.ndarray = None            # full-image uint8 mask (0/255) of the chosen blob
-    crop: np.ndarray = None            # input_size x input_size x 3 BGR model input (only if status == "ok")
+    crop: np.ndarray = None            # input_size x input_size x 3 BGR upright face (only if status == "ok")
     area_px: int = 0                   # blob area, full-image px
-    size_cm: tuple = None              # (width, height) of the bbox in cm
-    scale_k: int = 0                   # block size used for the crop (> crop.scale_k => object was too big)
-    blobs: list = field(default_factory=list)   # every component: dict(bbox, area, why) for the overlay
+    size_cm: tuple = None              # (side_1, side_2) of the rotated rectangle, cm
+    blobs: list = field(default_factory=list)   # every component: dict(bbox, area, why, box) for the overlay
     stages: dict = field(default_factory=dict)  # small debug images (edges, mask, ...)
 
 
@@ -181,65 +189,150 @@ def fill_holes(mask):
 
 
 # ── pipeline ────────────────────────────────────────────────────────────────────────────────
+def square_test(pts, area, b, ppcm, inside, min_inset_px=0.0):
+    """Rotated min-area rect of the points + the square filter. -> (rect, why); why == "" means it is a square.
+    inside(x, y) -> bool tells whether a pixel belongs to the object (corner probes)."""
+    rect = cv2.minAreaRect(pts.astype(np.float32))
+    s1, s2 = rect[1][0] + 1.0, rect[1][1] + 1.0    # pixel centres -> pixel extent
+    if max(s1, s2) / max(1.0, min(s1, s2)) > b["max_side_ratio"]:
+        return rect, "rect"
+    fill = area / (s1 * s2)
+    if fill < b["min_rect_fill"]:
+        return rect, "shape"
+    if not (b["side_cm"][0] <= (s1 + s2) / 2 / ppcm <= b["side_cm"][1]):
+        return rect, "size"
+    # corner probes: a square has its 4 corners filled; a disc / hand / triangle does not
+    # inset along each side = max(frac * side, min_inset_px): the morphology rounds corners by a fixed number of px
+    frac = min(0.25, max(b["corner_probe_frac"], min_inset_px / min(s1, s2)))
+    c = np.array(rect[0])
+    hits = 0
+    for q in cv2.boxPoints(rect):
+        x, y = c + (q - c) * (1.0 - 2.0 * frac)
+        hits += bool(inside(int(round(x)), int(round(y))))
+    # min_corner_hits = 3: one corner may be missing (a corner sticker with a weak edge); a disc misses all 4,
+    # a triangle at least 2
+    return rect, ("" if hits >= b["min_corner_hits"] else "corners")
+
+
+def axis_deg90(rect):
+    """Orientation of a rotated rect modulo 90 degrees (squares have no long axis), in [0, 90)."""
+    return rect[2] % 90.0
+
+
+def merge_fragments(comps, pix, b, ppcm, p_open_r=0):
+    """A face can fall apart into pieces when some of its stickers have no edge against the background:
+    "stripes" -> 2 strips, "corners" on a dark background -> 4 corner stickers or a cross + stickers.
+    Group every complete-size-checked component (rect computed, not touching the edge) that is close to another
+    (bbox gap <= merge_gap_cm) and aligned with it (orientations within merge_max_deg, modulo 90), and test the
+    convex hull of each group of >= 2 as a square. The caller keeps the LARGEST valid square, so the whole face
+    wins over one of its stickers.
+    -> list of new candidate components (mask given by their hull)."""
+    idx = [k for k, c in enumerate(comps) if c["rect"] is not None and not c["touches"]]
+    gap = b["merge_gap_cm"] * ppcm
+    parent = {k: k for k in idx}
+
+    def root(k):
+        while parent[k] != k:
+            k = parent[k]
+        return k
+
+    for i_, i in enumerate(idx):
+        for j in idx[i_ + 1:]:
+            (ax1, ay1, ax2, ay2), (bx1, by1, bx2, by2) = comps[i]["bbox"], comps[j]["bbox"]
+            g = max(max(ax1, bx1) - min(ax2, bx2), max(ay1, by1) - min(ay2, by2), 0)
+            d = abs(axis_deg90(comps[i]["rect"]) - axis_deg90(comps[j]["rect"]))
+            if g <= gap and min(d, 90.0 - d) <= b["merge_max_deg"]:
+                parent[root(j)] = root(i)
+    groups = {}
+    for k in idx:
+        groups.setdefault(root(k), []).append(k)
+    out = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        hull = cv2.convexHull(np.vstack([pix[k] for k in members]).astype(np.int32))
+        area = int(cv2.contourArea(hull)) + 1
+        rect, why = square_test(hull.reshape(-1, 2), area, b, ppcm,
+                                lambda x, y, h=hull: cv2.pointPolygonTest(h, (float(x), float(y)), False) >= 0,
+                                min_inset_px=p_open_r + 1)
+        xs, ys = hull[:, 0, 0], hull[:, 0, 1]
+        out.append(dict(label=None, hull=hull, bbox=(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1),
+                        area=area, why=why, touches=False, rect=rect))
+    return out
+
+
 def segment(small_bgr, p):
-    """-> (edges, mask, components) at the downsampled resolution."""
+    """-> (edges, mask, labels, components) at the downsampled resolution."""
     e = p["edges"]
     m, gx, gy = gradient(small_bgr, e["chroma_gain"])
     nms = nonmax(m, gx, gy)
     lo, hi = thresholds(nms, e)
     edges = hysteresis(nms, lo, hi, e["min_edge_px"])
-    r = p["mask"]["close_r"]
+    r, ro = p["mask"]["close_r"], p["mask"]["open_r"]
     mask = erode(fill_holes(dilate(edges, r)), r)
+    if ro > 0:
+        mask = dilate(erode(mask, ro), ro)
 
     b = p["blob"]
+    f = p["image"]["downsample"]
+    ppcm = p["crop"]["px_per_cm"] / f            # px per cm at the downsampled resolution
     H, W = mask.shape
     n, lab, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    comps = []
+    comps, pix = [], []
     for i in range(1, n):
         x, y, w, h, area = (int(v) for v in stats[i])
-        fill = area / float(w * h)
-        aspect = max(w, h) / float(max(1, min(w, h)))
-        why = ""
-        if w <= b["seam_max_w_px"] and h >= b["seam_min_h_frac"] * H:
-            why = "seam"
-        elif area < b["min_area_px"]:
+        touches = x <= b["edge_margin_px"] or x + w >= W - b["edge_margin_px"]
+        ys, xs = np.nonzero(lab[y:y + h, x:x + w] == i)
+        pts = np.column_stack([xs + x, ys + y])
+        rect, why = None, ""
+        if area < b["min_area_px"]:
             why = "small"
+            if area >= b["merge_min_px"] and not touches:   # can still be a piece of a face (sticker)
+                rect = cv2.minAreaRect(pts.astype(np.float32))
         elif area > b["max_area_px"]:
             why = "big"
-        elif fill < b["min_fill"]:
-            why = "sparse"
-        elif aspect > b["max_aspect"]:
-            why = "thin"
-        touches = x <= b["edge_margin_px"] or x + w >= W - b["edge_margin_px"]
-        comps.append(dict(label=i, bbox=(x, y, x + w, y + h), area=area, fill=fill, why=why, touches=touches))
+        elif not touches:                          # a cube entering from the side is not square yet
+            rect, why = square_test(pts, area, b, ppcm,
+                                    lambda x, y, i=i: 0 <= y < H and 0 <= x < W and lab[y, x] == i,
+                                    min_inset_px=ro + 1)
+        comps.append(dict(label=i, hull=None, bbox=(x, y, x + w, y + h), area=area, why=why, touches=touches,
+                          rect=rect))
+        pix.append(pts)
+    if b.get("merge_gap_cm", 0) > 0:
+        comps += merge_fragments(comps, pix, b, ppcm, ro)
     return edges, mask, lab, comps
 
 
-def make_crop(img, blob_mask, bbox, p):
-    """Square crop at a fixed px/cm scale around bbox, background -> fill, k x k block mean -> input_size."""
-    c = p["crop"]
-    n = c["input_size"]
-    x1, y1, x2, y2 = bbox
-    f = p["image"]["downsample"]
-    k = c["scale_k"]
-    while n * k < max(x2 - x1, y2 - y1) + 2 * f:   # object bigger than the square: shrink (flagged by k)
-        k += 1
-    side = n * k
-    sx, sy = (x1 + x2) // 2 - side // 2, (y1 + y2) // 2 - side // 2
-    canvas = np.empty((side, side, 3), np.uint8)
-    canvas[:] = np.array(c["fill_bgr"], np.uint8)
-    H, W = img.shape[:2]
-    ix1, iy1, ix2, iy2 = max(0, sx), max(0, sy), min(W, sx + side), min(H, sy + side)
-    if ix2 > ix1 and iy2 > iy1:
-        src = img[iy1:iy2, ix1:ix2]
-        m = blob_mask[iy1:iy2, ix1:ix2] > 0
-        dst = canvas[iy1 - sy:iy2 - sy, ix1 - sx:ix2 - sx]
-        dst[m] = src[m]
-    return downsample(canvas, k), k
+def order_corners(pts):
+    """4 points -> (tl, tr, br, bl): start at the min x+y corner, go clockwise on screen (y down)."""
+    c = pts.mean(axis=0)
+    ang = np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0])
+    pts = pts[np.argsort(ang)]
+    start = int(np.argmin(pts[:, 0] + pts[:, 1]))
+    return np.roll(pts, -start, axis=0)
+
+
+def rect_corners_full(rect, f, off, inset):
+    """Rotated rect at the downsampled resolution -> 4 ordered corners in full-res px, shrunk by inset."""
+    (cx, cy), (w, h), a = rect
+    rect = ((cx, cy), (w + 1.0, h + 1.0), a)       # include the pixels' extent, not just their centres
+    pts = cv2.boxPoints(rect).astype(np.float64)
+    c = pts.mean(axis=0)
+    pts = c + (pts - c) * (1.0 - 2.0 * inset)
+    pts = (pts + 0.5) * f - 0.5 + np.array(off, np.float64)   # block centre -> full-res pixel coords
+    return order_corners(pts).astype(np.float32)
+
+
+def rectify(img, corners, n):
+    """Affine warp: corners (tl, tr, br, bl) -> upright n x n image (bilinear, replicate border)."""
+    src = corners[:3].astype(np.float32)
+    dst = np.array([[-0.5, -0.5], [n - 0.5, -0.5], [n - 0.5, n - 0.5]], np.float32)
+    A = cv2.getAffineTransform(src, dst)
+    return cv2.warpAffine(img, A, (n, n), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
 def process(img, p=None, keep_stages=False):
-    """Full pipeline on one BGR image (the cut band). Returns a Detection."""
+    """Full pipeline on one BGR image (frame or cut band). Returns a Detection."""
     p = p or load_params()
     f = p["image"]["downsample"]
     H, W = img.shape[:2]
@@ -250,31 +343,41 @@ def process(img, p=None, keep_stages=False):
     edges, mask, lab, comps = segment(small, p)
 
     to_full = lambda bb: (wx1 + bb[0] * f, wy1 + bb[1] * f, wx1 + bb[2] * f, wy1 + bb[3] * f)
-    blobs = [dict(bbox=to_full(cp["bbox"]), area=cp["area"] * f * f, why=cp["why"] or ("edge" if cp["touches"] else ""))
-             for cp in comps]
+    blobs = []
+    for cp in comps:
+        box = rect_corners_full(cp["rect"], f, (wx1, wy1), 0.0) if cp["rect"] is not None else None
+        blobs.append(dict(bbox=to_full(cp["bbox"]), area=cp["area"] * f * f, box=box,
+                          why=cp["why"] or ("edge" if cp["touches"] else "")))
     stages = dict(small=small, edges=edges, mask=mask) if keep_stages else {}
 
     valid = [cp for cp in comps if not cp["why"]]
     if not valid:
         return Detection("none", reason="no object" if not comps else "rejected", blobs=blobs, stages=stages)
-    best = max(valid, key=lambda cp: cp["area"])
+    best = max(valid, key=lambda cp: (not cp["touches"], cp["area"]))   # prefer a complete square
 
-    blob_small = (lab == best["label"]).astype(np.uint8) * 255
+    if best["hull"] is not None:                   # merged fragments: the hull is the object
+        blob_small = np.zeros(mask.shape, np.uint8)
+        cv2.fillConvexPoly(blob_small, best["hull"], 255)
+    else:
+        blob_small = (lab == best["label"]).astype(np.uint8) * 255
     full_mask = np.zeros((H, W), np.uint8)
     up = np.repeat(np.repeat(blob_small, f, axis=0), f, axis=1)
     full_mask[wy1:wy1 + up.shape[0], wx1:wx1 + up.shape[1]] = up
-    bbox = to_full(best["bbox"])
-    ppcm = p["crop"]["px_per_cm"]
-    det = Detection("partial" if best["touches"] else "ok", bbox=bbox, mask=full_mask, area_px=best["area"] * f * f,
-                    size_cm=((bbox[2] - bbox[0]) / ppcm, (bbox[3] - bbox[1]) / ppcm), blobs=blobs, stages=stages)
+    det = Detection("partial" if best["touches"] else "ok", bbox=to_full(best["bbox"]), mask=full_mask,
+                    area_px=best["area"] * f * f, blobs=blobs, stages=stages)
     if det.status == "ok":
-        det.crop, det.scale_k = make_crop(img, full_mask, bbox, p)
+        rect = best["rect"]
+        ppcm = p["crop"]["px_per_cm"] / f
+        det.size_cm = ((rect[1][0] + 1) / ppcm, (rect[1][1] + 1) / ppcm)
+        det.angle = float(rect[2] % 90.0)
+        det.corners = rect_corners_full(rect, f, (wx1, wy1), p["crop"]["inset_frac"])
+        det.crop = rectify(img, det.corners, p["crop"]["input_size"])
     return det
 
 
 # ── debug view ──────────────────────────────────────────────────────────────────────────────
 def debug_view(img, det, p=None, width=960):
-    """Stacked image: band with boxes | edges | mask, plus the model input zoomed on the right."""
+    """Stacked image: frame with boxes | edges | mask, plus the model input zoomed on the right."""
     p = p or load_params()
     view = img.copy()
     win = p["image"]["window"]
@@ -283,18 +386,24 @@ def debug_view(img, det, p=None, width=960):
     for b in det.blobs:
         x1, y1, x2, y2 = b["bbox"]
         if b["why"]:
-            cv2.rectangle(view, (x1, y1), (x2 - 1, y2 - 1), (200, 0, 200), 1)
+            if b["box"] is not None:
+                cv2.polylines(view, [b["box"].astype(np.int32)], True, (200, 0, 200), 1, cv2.LINE_AA)
+            else:
+                cv2.rectangle(view, (x1, y1), (x2 - 1, y2 - 1), (200, 0, 200), 1)
             cv2.putText(view, b["why"], (x1, min(y2 + 12, view.shape[0] - 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                         (200, 0, 200), 1, cv2.LINE_AA)
-        else:                                      # valid but not the largest: not classified this frame
-            cv2.rectangle(view, (x1, y1), (x2 - 1, y2 - 1), (60, 200, 60), 1)
+        elif b["box"] is not None:                 # valid square but not the chosen one
+            cv2.polylines(view, [b["box"].astype(np.int32)], True, (60, 200, 60), 1, cv2.LINE_AA)
     col = {"ok": (60, 200, 60), "partial": (0, 200, 255)}.get(det.status, (0, 0, 255))
-    if det.bbox:
+    if det.corners is not None:
+        cv2.polylines(view, [det.corners.astype(np.int32)], True, col, 2, cv2.LINE_AA)
+        cv2.circle(view, tuple(int(v) for v in det.corners[0]), 3, (0, 0, 255), -1)   # tl = crop's top-left
+    elif det.bbox:
         x1, y1, x2, y2 = det.bbox
         cv2.rectangle(view, (x1, y1), (x2 - 1, y2 - 1), col, 2)
     txt = det.status if det.status != "none" else f"none ({det.reason})"
     if det.size_cm:
-        txt += f"  {det.size_cm[0]:.1f}x{det.size_cm[1]:.1f} cm  k={det.scale_k}"
+        txt += f"  {det.size_cm[0]:.1f}x{det.size_cm[1]:.1f} cm  {det.angle:.0f} deg"
     cv2.putText(view, txt, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(view, txt, (6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
 
@@ -306,7 +415,8 @@ def debug_view(img, det, p=None, width=960):
     left = np.vstack(rows)
     side = left.shape[0]
     crop = det.crop if det.crop is not None else np.full((8, 8, 3), 40, np.uint8)
-    right = cv2.resize(crop, (min(side, 256), min(side, 256)), interpolation=cv2.INTER_NEAREST)
+    sz = min(side, max(img.shape[0], 256))
+    right = cv2.resize(crop, (sz, sz), interpolation=cv2.INTER_NEAREST)
     right = np.pad(right, ((0, side - right.shape[0]), (0, 0), (0, 0)))
     out = np.hstack([left, right])
     s = width / out.shape[1]

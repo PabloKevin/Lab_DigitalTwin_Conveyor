@@ -5,45 +5,62 @@
     "window": null
   },
   "edges": {
-    "chroma_gain": 1.5,
+    "chroma_gain": 3.7,
     "mode": "fixed",
-    "lo": 40,
-    "hi": 100,
+    "lo": 192,
+    "hi": 374,
     "hi_percentile": 92,
     "lo_ratio": 0.45,
     "min_edge_px": 12
   },
   "mask": {
-    "close_r": 4
+    "close_r": 1,
+    "open_r": 2
   },
   "blob": {
-    "min_area_px": 120,
+    "min_area_px": 56,
     "max_area_px": 9000,
-    "min_fill": 0.35,
-    "max_aspect": 6.0,
     "edge_margin_px": 2,
-    "seam_max_w_px": 18,
-    "seam_min_h_frac": 0.75
+    "max_side_ratio": 1.3,
+    "min_rect_fill": 0.72,
+    "side_cm": [
+      3.0,
+      10.0
+    ],
+    "merge_gap_cm": 3.5,
+    "merge_max_deg": 12,
+    "corner_probe_frac": 0.12,
+    "min_corner_hits": 3,
+    "merge_min_px": 20
   },
   "crop": {
     "px_per_cm": 10.0,
     "input_size": 64,
-    "scale_k": 2,
-    "fill_bgr": [128, 128, 128]
+    "inset_frac": 0.03
   },
   "model": {
-    "classes": ["class_a", "class_b", "class_c", "other"]
+    "classes": [
+      "solid",
+      "stripes",
+      "corners",
+      "other"
+    ]
   },
   "decision": {
     "n_frames": 5,
     "min_agree": 4,
-    "tau": 0.70
+    "tau": 0.7
   },
   "destinations": {
-    "class_a": "servo_1",
-    "class_b": "servo_2",
-    "class_c": "belt_end",
+    "solid": "servo_1",
+    "stripes": "servo_2",
+    "corners": "belt_end",
     "other": "belt_end",
     "dudoso": "belt_end"
+  },
+  "camera": {
+    "saturation": 2,
+    "brightness": 0,
+    "contrast": 0
   }
 }

@@ -11,7 +11,7 @@ The raw band is kept so the whole dataset can be re-segmented later if params.js
 (python -m classifier.preprocess ... or a later re-crop script).
 
 Usage (repo root, conda env "Control"):
-    python -m classifier.capture --url http://10.82.234.15 --session bench_white_01
+    python -m classifier.capture --url http://10.82.234.15 --session bench_white_01 --tune
     python -m classifier.capture --source some_belt_video.mp4 --tune       # tune params on a recording
     python -m classifier.capture --source dataset/bench_white_01/class_a    # re-check saved bands
 
@@ -38,20 +38,31 @@ TUNE = [  # (trackbar name, params path, max, scale)
     ("chroma x10", ("edges", "chroma_gain"), 40, 10),
     ("min edge px", ("edges", "min_edge_px"), 80, 1),
     ("close r", ("mask", "close_r"), 12, 1),
+    ("merge gap x10cm", ("blob", "merge_gap_cm"), 80, 10),
+    ("open r", ("mask", "open_r"), 6, 1),
     ("min area", ("blob", "min_area_px"), 2000, 1),
+    ("side ratio x100", ("blob", "max_side_ratio"), 200, 100),
+    ("rect fill x100", ("blob", "min_rect_fill"), 100, 100),
 ]
+CAM_TUNE = ("saturation", "brightness", "contrast")   # camera /control vars, -2..2 (trackbar 0..4)
 
 
 # ── frame sources ───────────────────────────────────────────────────────────────────────────
 class Esp32Cam:
-    def __init__(self, base, crop):
+    def __init__(self, base, crop, cam_settings):
         self.base = base.rstrip("/")
         self.s = requests.Session()
-        try:
-            self.s.get(f"{self.base}/control", params=dict(var="crop", val=int(crop)), timeout=3)
-        except requests.RequestException as e:
-            print(f"warning: could not set crop={crop} on the camera: {e}")
         self.name = self.base
+        self.set("crop", int(crop))
+        for var, val in cam_settings.items():        # the stream firmware boots with saturation -2 (washed out)
+            self.set(var, val)
+
+    def set(self, var, val):
+        try:
+            r = self.s.get(f"{self.base}/control", params=dict(var=var, val=int(val)), timeout=3)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            print(f"warning: could not set {var}={val} on the camera: {e}")
 
     def read(self):
         r = self.s.get(f"{self.base}/capture", timeout=5)
@@ -108,7 +119,9 @@ class Writer:
                    status=det.status if det else "background",
                    bbox=list(det.bbox) if det and det.bbox else None,
                    area_px=det.area_px if det else 0, size_cm=list(det.size_cm) if det and det.size_cm else None,
-                   scale_k=det.scale_k if det else 0, params=self.p)
+                   angle=det.angle if det else 0.0,
+                   corners=det.corners.tolist() if det is not None and det.corners is not None else None,
+                   params=self.p)
         with open(self.manifest, "a") as f:
             f.write(json.dumps(rec) + "\n")
         self.n += 1
@@ -131,7 +144,7 @@ def main():
     p = pp.load_params(a.params)
     classes = p["model"]["classes"]
     if a.url:
-        src = Esp32Cam(a.url, a.crop)
+        src = Esp32Cam(a.url, a.crop, p.get("camera", {}))
     elif a.source and (os.path.isdir(a.source) or any(ch in a.source for ch in "*?")
                        or a.source.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))):
         src = Files(a.source)
@@ -146,6 +159,9 @@ def main():
     if a.tune:
         for name, (sec, key), mx, sc in TUNE:
             cv2.createTrackbar(name, win, int(round(p[sec][key] * sc)), mx, lambda _v: None)
+        if isinstance(src, Esp32Cam):
+            for var in CAM_TUNE:
+                cv2.createTrackbar(f"cam {var}", win, int(p.get("camera", {}).get(var, 0)) + 2, 4, lambda _v: None)
 
     cls_i, auto, last_save, msg, msg_t = 0, False, 0.0, "", 0.0
     while True:
@@ -163,6 +179,13 @@ def main():
             for name, (sec, key), _mx, sc in TUNE:
                 v = cv2.getTrackbarPos(name, win)
                 p[sec][key] = v / sc if sc != 1 else v
+            if isinstance(src, Esp32Cam):
+                cam = p.setdefault("camera", {})
+                for var in CAM_TUNE:
+                    v = cv2.getTrackbarPos(f"cam {var}", win) - 2
+                    if cam.get(var) != v:
+                        cam[var] = v
+                        src.set(var, v)
 
         det = pp.process(band, p, keep_stages=True)
         view = pp.debug_view(band, det, p, width=1100)
