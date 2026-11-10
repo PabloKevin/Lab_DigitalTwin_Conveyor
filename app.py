@@ -132,7 +132,10 @@ def divergence_view():
 
 def belt_objects():
     """Objects to draw/list, from the sensor picked with the "Object position from" control.
-    The ultrasonic sensor only sees the object nearest to it, so it gives at most one object."""
+    The ultrasonic sensor only sees the object nearest to it, so it gives at most one object.
+    While the sorting cycle runs, the cube it handles is shown (its class, position measured or followed by encoder)."""
+    if orch is not None and orch.state not in ("IDLE", "SAFE_STOP"):
+        return orch.objects()
     if state.params.get("pos_source", "camera") != "ultrasonic":
         return list(state.objects)
     x = cfg.us_position_cm(state.get("us_distance_cm"))
@@ -216,6 +219,11 @@ def cycle_view():
         arm = "simulated (Sandbox)"
     info = [html.Div(className="kv", children=[html.Span("Robotic arm", className="k"),
                                                 html.Span(f"{arm}  ·  last: {v['arm_last'] or '—'}", className="v")])]
+    if v["src"] == "ultrasonic":
+        us = "nothing in range" if v["us"] is None else f"{v['us']:.1f} cm"
+        info.append(html.Div(className="kv", children=[
+            html.Span("Ultrasonic", className="k"),
+            html.Span(f"{us}  ·  classify at {cfg.CYCLE['ultrasonic']['classify_cm']:g} cm", className="v")]))
     cur = v["cube"] or (v["cubes"][0] if v["cubes"] else None)
     body = []
     if cur:
@@ -255,11 +263,15 @@ def cycle_view():
 
 
 def cycle_marks():
-    """Belt positions (cm) of the camera stop line and of the arm, for the belt drawing."""
+    """Belt positions (cm) for the belt drawing: [(cm, label, is_camera)] - camera stop line + one per push stop."""
     fr = state.cam_frame
     w = fr[0].shape[1] if fr is not None else 640
     stop_cm = vision.px_to_cm(w * cfg.CYCLE["stop_x_frac"])
-    return stop_cm, stop_cm + cfg.CYCLE["arm_distance_cm"]
+    marks, seen = [(stop_cm, "cam", True)], {}
+    for p in cfg.CYCLE["push"].values():                 # pushes at the same spot share one mark
+        seen.setdefault(p["cm"], []).append(p["routine"].replace("PUSH", "P"))
+    marks += [(stop_cm + cm, "/".join(r), False) for cm, r in seen.items()]
+    return marks
 
 
 def belt_figure():
@@ -294,8 +306,8 @@ def belt_figure():
                                          size=18, color=GREEN, line=dict(color=INK, width=1))))
 
     # sorting cycle: camera stop line and robotic arm position
-    stop_cm, arm_cm = cycle_marks()
-    for x, label, col in ((stop_cm, "cam", AMBER), (arm_cm, "arm", PURPLE)):
+    for x, label, is_cam in cycle_marks():
+        col = AMBER if is_cam else PURPLE
         if 0 <= x <= L + 8:
             fig.add_shape(type="line", x0=x, x1=x, y0=0.6, y1=5.4, line=dict(color=col, width=2, dash="dash"))
             fig.add_annotation(x=x, y=0.35, text=label, showarrow=False, font=dict(color=col, size=11))
@@ -381,6 +393,8 @@ def widget(c):
 def controls_block():
     groups = {}
     for c in cfg.CONTROLS:
+        if c.get("group") == "Sorting cycle":          # drawn inside the Sorting cycle card
+            continue
         groups.setdefault(c.get("group", "Controls"), []).append(c)
     tags = {"real": "real", "twin": "twin only", "both": "real + twin", "camera": "ESP32-CAM"}
     out = []
@@ -421,6 +435,9 @@ def serve_layout():
                          html.Button("Start", id="cyc-start", className="btn go"),
                          html.Button("Stop", id="cyc-stop", className="btn"),
                          html.Button("Reset fault", id="cyc-reset", className="btn")]),
+                     *[html.Div(className="ctl", children=[html.Div(className="ctl-h", children=[html.Span(c["label"])]),
+                                                          widget(c)])
+                       for c in cfg.CONTROLS if c.get("group") == "Sorting cycle"],
                      html.Div(id="cycle")),
                 card("Camera", html.Img(src="/video_feed", className="cam")),
                 html.Div(id="objects"),

@@ -92,10 +92,13 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
 
 ```
 IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED --centre reaches the line--> stop
-  --> CLASSIFYING (belt stopped, vote of 3 frames, NumPy CNN classifier/models/cube_classifier.npz)
-        solid / stripes --> TO_ARM (belt runs CYCLE["arm_distance_cm"] by encoder) --> stop --> PUSHING:
-                            MQTT eezybot/cmd "PUSH1" / "PUSH2", wait for "IDLE" on eezybot/status --> RUN
-        corners / other / dudoso --> TO_END (belt runs clear_cm) --> RUN   (cube rides to the end basket)
+  --> CLASSIFYING (belt stopped, 3 frames, NumPy CNN classifier/models/cube_classifier.npz; the class is the one
+                   with the highest mean probability - no "dudoso" unless CYCLE["uncertain"] = True)
+        solid / stripes / corners --> TO_ARM (belt runs CYCLE["push"][class]["cm"] by encoder) --> stop -->
+                            PUSHING: MQTT eezybot/cmd "PUSH1" / "PUSH2" / "PUSH3", wait for "IDLE",
+                            then "HOME", wait for "IDLE" --> RUN
+        other --> REVERSE (belt backwards until the cube left the belt at the origin:
+                            reverse_cm of travel or reverse_s, whichever first) --> forward again --> RUN
   any fault (telemetry / camera lost, belt not stopping or stalled, arm ERR / timeout / offline) or E-stop
         --> SAFE_STOP (belt stopped, arm STOP) until "Reset fault"
 ```
@@ -104,11 +107,19 @@ IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED --centre
   shows the stop line and the face being classified.
 * Needs `VISION["mode"] = "bgsub"` (camera frames) and the arm on the same MQTT broker (its firmware's `MQTT_HOST` =
   this PC's IP). In **Sandbox** the belt commands only move the twin and the arm is simulated.
-* Before the first run **measure `CYCLE["arm_distance_cm"]`** (stop line → arm push point). Then tune
-  `stop_latency_s` from `logs/cycles.csv`: `x_final_px` (camera) and `arm_travel_cm - arm_distance_cm` (arm) ~ 0.
+* Before the first run **measure, for each class in `CYCLE["push"]`, the belt distance (cm) from the stop line to
+  where that routine hits the cube**, and `reverse_cm` (stop line → origin end of the belt + a few cm). Then tune
+  `stop_latency_s` from `logs/cycles.csv`: `x_final_px` (camera) and `arm_travel_cm - target_cm` (arm) ~ 0.
+* **Stop positions from Camera / Ultrasonic** (switch in the Sorting cycle card, default `CYCLE["position_source"]`).
+  Ultrasonic: the belt stops when the HC-SR04 reads `CYCLE["ultrasonic"]["classify_cm"]` (cube under the camera) and,
+  per class, `push[cls]["us_cm"]` (cube at the push point); reverse ends when the sensor sees the cube past the belt
+  start. Measure them by placing the cube there and reading "Distance (ultrasonic)". If the sensor loses the cube on
+  the way to the arm the encoder distance (`cm`) is used. The camera is still what classifies.
+* While the cycle runs, the belt drawing shows the cube being handled with its class (camera / sensor position,
+  then encoder dead-reckoning after it leaves the camera).
 * Every cube: one line in `logs/cycles.csv` (class, confidence, routine, outcome, stop / classify / arm / cycle
   latencies, deadline misses) and JSON events on `conveyor/cycle` - material for the report's deadlines section.
-* Tests: `python -m unittest tests.test_orchestrator -v` (simulated plant, 12 scenarios incl. faults).
+* Tests: `python -m unittest tests.test_orchestrator -v` (simulated plant: per-class stops, reverse, faults).
 
 ## 3. Serial protocol (conveyor) and MQTT (camera only)
 

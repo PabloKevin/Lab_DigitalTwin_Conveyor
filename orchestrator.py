@@ -3,10 +3,17 @@ orchestrator.py - the automatic sorting cycle (lab 03 state machine), run by the
 
     IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED
       --cube centre reaches the stop line (image centre)--> stop belt --> CLASSIFYING
-      --vote of N frames (classifier.live.Voter, params.json "decision")-->
-          class with an arm routine (config.ARM["routines"]) --> TO_ARM: belt runs arm_distance_cm (encoder)
-                --> stop --> PUSHING: MQTT "PUSH1"/"PUSH2" to the arm, wait for "IDLE" --> RUN
-          other / corners / dudoso --> TO_END: belt runs clear_cm --> RUN (the cube rides to the end basket)
+   (Where the cube is comes from the camera or from the HC-SR04 ultrasonic sensor: config.CYCLE["position_source"],
+    switchable on the page. With the sensor, the stops are sensor readings: CYCLE["ultrasonic"]["classify_cm"] and
+    each class's "us_cm"; the camera is then only used to classify.)
+      --N frames (params.json "decision" n_frames) -> class with the highest mean probability
+        (CYCLE["uncertain"] = True brings back the "dudoso" rule of classifier.live.Voter)-->
+          class in config.CYCLE["push"] --> TO_ARM: belt runs that class's cm (encoder) --> stop
+                --> PUSHING: MQTT routine ("PUSH1"/"PUSH2"/"PUSH3") to the arm, wait for "IDLE",
+                    then "HOME" (ARM["home_after_push"]), wait for "IDLE" --> RUN
+          class in CYCLE["reverse_classes"] (other, dudoso) --> REVERSE: belt runs backwards until the cube has left
+                the belt at the origin (reverse_cm of travel or reverse_s, whichever first) --> forward again, RUN
+          any other class --> TO_END: belt runs clear_cm --> RUN (the cube rides to the end basket)
     any fault (telemetry or camera lost, belt not stopping / stalling, arm error / timeout / offline) or E-stop
       --> SAFE_STOP: belt stopped, arm STOP; stays there until "Reset" on the page.
 
@@ -32,7 +39,7 @@ from state import state
 
 C, A = cfg.CYCLE, cfg.ARM
 ROOT = os.path.dirname(os.path.abspath(__file__))
-STATES = ["IDLE", "RUN", "OBJECT_DETECTED", "CLASSIFYING", "TO_ARM", "PUSHING", "TO_END", "SAFE_STOP"]
+STATES = ["IDLE", "RUN", "OBJECT_DETECTED", "CLASSIFYING", "TO_ARM", "PUSHING", "REVERSE", "TO_END", "SAFE_STOP"]
 
 
 class Plant:
@@ -62,6 +69,18 @@ class Plant:
     def frame(self):
         return state.cam_frame
 
+    def position_source(self):
+        return state.params.get("cycle_source", C["position_source"])
+
+    def us_sample(self):
+        """(time of the reading, distance cm or -1) of the latest ultrasonic telemetry, or None."""
+        t = state.stamps.get("us_distance_cm")
+        return None if t is None else (t, state.values.get("us_distance_cm"))
+
+    def px_to_cm(self, cx):
+        import vision
+        return vision.px_to_cm(cx)
+
     def geometry(self):
         """(px per cm along the belt, +1 if forward moves to +x in the image else -1) from the camera calibration."""
         import vision
@@ -87,7 +106,9 @@ class Orchestrator:
             model = NpModel(os.path.join(ROOT, C["model"]))
         self.model = model
         d = self.p["decision"]
-        self.new_voter = lambda: Voter(self.classes, d["n_frames"], d["min_agree"], d["tau"])
+        self.new_voter = lambda: Voter(self.classes, d["n_frames"], d["min_agree"], d["tau"],
+                                       uncertain=C.get("uncertain", False))
+        self._seen_probs = []                      # every face classified for the current cube (timeout fallback)
         self.plant, self.clock = plant, clock
         self.lock = threading.RLock()
         self.state, self.since, self.msg = "IDLE", clock(), "press Start"
@@ -100,6 +121,9 @@ class Orchestrator:
         self.last_seq, self.last_frame_wall, self.last_det = None, clock(), None
         self.face = self.probs = self.vote = None
         self.t_moving = clock()
+        self.us = None                             # filtered ultrasonic distance (cm), None = nothing / no data
+        self._us_hist, self._us_t = deque(maxlen=C["ultrasonic"]["median_n"]), None
+        self._dir, self._last_travel, self.free_x = "S", None, None   # for the cube position on the twin belt
         self._thread = None
 
     # ── commands from the page (thread-safe) ───────────────────────────────────────────────
@@ -109,7 +133,7 @@ class Orchestrator:
                 return f"cannot start from {self.state}" + (" (press Reset)" if self.state == "SAFE_STOP" else "")
             now = self.clock()
             self.last_frame_wall = self.t_moving = now
-            self.plant.belt("F", C["run_speed_pct"])
+            self._belt("F", C["run_speed_pct"])
             self._goto("RUN", "cycle started")
             return "started"
 
@@ -117,7 +141,7 @@ class Orchestrator:
         with self.lock:
             if self.state in ("IDLE", "SAFE_STOP"):
                 return "already stopped"
-            self.plant.belt("S")
+            self._belt("S")
             if self.cube:
                 self._finish("stopped by operator")
             self._goto("IDLE", "stopped by operator")
@@ -161,7 +185,9 @@ class Orchestrator:
         with self.lock:
             now = self.clock()
             det = self._new_detection(now)
+            self._us_update(now)
             sp = self.plant.speed()
+            self._track_position(det)
             if sp is not None and abs(sp) >= C["stopped_cm_s"]:
                 self.t_moving = now
             self._arm_events(now)
@@ -220,6 +246,72 @@ class Orchestrator:
         ppcm = self.plant.geometry()[0]
         return abs(sp or 0.0) * C["stop_latency_s"] * ppcm
 
+    def _us_update(self, now):
+        """Median of the last readings; None when the sensor sees nothing or its data is stale."""
+        smp = self.plant.us_sample()
+        if smp is None or smp[1] is None or now - smp[0] > C["telemetry_timeout_s"]:
+            self._us_hist.clear()
+            self.us = None
+            return
+        if smp[0] != self._us_t:
+            self._us_t = smp[0]
+            if smp[1] < 0:                          # firmware: -1 = no echo (already debounced over 3 readings)
+                self._us_hist.clear()
+            else:
+                self._us_hist.append(float(smp[1]))
+        self.us = float(np.median(self._us_hist)) if self._us_hist else None
+
+    def us_to_go(self, target_cm):
+        """Belt travel (cm, + = still to come when moving forward) until the sensor reads target_cm."""
+        if self.us is None:
+            return None
+        return -cfg.ULTRASONIC["facing"] * (self.us - target_cm)
+
+    def _belt(self, direction, speed_pct=None, force=False):
+        self._dir = direction
+        self.plant.belt(direction, speed_pct, force=force)
+
+    def _track_position(self, det):
+        """Belt position (cm) of the cube being handled, for the twin's belt drawing: measured while the camera /
+        sensor sees it, otherwise dead-reckoned from the encoder travel in the commanded direction."""
+        travel = self.plant.travel()
+        moved = 0.0 if self._last_travel is None else abs(travel - self._last_travel)
+        self._last_travel = travel
+        sign = {"F": 1.0, "R": -1.0}.get(self._dir, 0.0)
+        meas = None
+        if self.plant.position_source() == "ultrasonic" or (self.cube and self.cube.get("src") == "ultrasonic"):
+            if self.us is not None:
+                meas = cfg.us_position_cm(self.us)
+        elif det is not None:
+            meas = self.plant.px_to_cm(det["cx"]) if det["status"] != "none" else None
+            if self.cube and self.state not in ("OBJECT_DETECTED", "CLASSIFYING"):
+                meas = None                         # after the decision the camera may see the NEXT cube
+        if self.cube is not None:
+            if meas is not None:
+                self.cube["x_cm"] = meas
+            elif self.cube.get("x_cm") is not None:
+                self.cube["x_cm"] += sign * moved
+            self.free_x = None
+        elif det is not None or self.plant.position_source() == "ultrasonic":
+            self.free_x = meas
+
+    def objects(self):
+        """Cube(s) for the twin's belt drawing / objects table (same fields as vision's objects)."""
+        with self.lock:
+            sp = self.plant.speed()
+            v = None if sp is None else {"F": 1, "R": -1}.get(self._dir, 0) * abs(sp)
+            mk = lambda oid, label, x: dict(id=oid, label=label, x_cm=x, speed_cm_s=v, expected_cm=None, err_cm=None,
+                                            diverging=False)
+            if self.cube is not None and self.cube.get("x_cm") is not None:
+                c = self.cube
+                return [mk(c["id"], c.get("cls") or "cube", c["x_cm"])]
+            if self.free_x is not None:
+                return [mk("-", "cube", self.free_x)]
+            return []
+
+    def _src(self):
+        return self.cube.get("src", "camera") if self.cube else self.plant.position_source()
+
     # ── states ──────────────────────────────────────────────────────────────────────────────
     def _s_idle(self, now, det, sp):
         pass
@@ -233,14 +325,22 @@ class Orchestrator:
     def _s_run(self, now, det, sp):
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
-        if det and det["status"] != "none" and det["s"] < -C["arm_margin_px"]:
-            self.cube = dict(id=self.next_id, t_detect=now)
+        src = self.plant.position_source()
+        if src == "ultrasonic":
+            togo = self.us_to_go(C["ultrasonic"]["classify_cm"])
+            seen = togo is not None and togo > C["ultrasonic"]["arm_margin_cm"]
+        else:
+            seen = det is not None and det["status"] != "none" and det["s"] < -C["arm_margin_px"]
+        if seen:
+            self.cube = dict(id=self.next_id, t_detect=now, src=src)
             self.next_id += 1
-            self._goto("OBJECT_DETECTED", f"cube #{self.cube['id']} approaching")
+            self._goto("OBJECT_DETECTED", f"cube #{self.cube['id']} approaching ({src})")
 
     def _s_object_detected(self, now, det, sp):
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
+        if self._src() == "ultrasonic":
+            return self._us_object_detected(now, sp)
         if det and det["status"] != "none":
             self.cube["t_seen"] = now
             if det["s"] >= -self.lead_px(sp):
@@ -251,13 +351,36 @@ class Orchestrator:
                     self.cube["cls"] = "missed"
                     self._finish("missed")
                     return self._goto("RUN", "missed cube")
-                self.plant.belt("S")
-                self.cube.update(t_stop_cmd=now, x_err_px=det["s"])
-                self.vote, self.face, self.probs = self.new_voter(), None, None
-                self._goto("CLASSIFYING", f"cube #{self.cube['id']} at the stop line")
+                self.cube.update(x_err_px=det["s"])
+                self._stop_to_classify(now)
         elif now - self.cube.get("t_seen", self.cube["t_detect"]) > 1.5:
             self.cube = None
             self._goto("RUN", "cube lost before the stop line")
+
+    def _us_object_detected(self, now, sp):
+        U = C["ultrasonic"]
+        togo = self.us_to_go(U["classify_cm"])
+        if togo is None:
+            if now - self.cube.get("t_seen", self.cube["t_detect"]) > 1.5:
+                self.cube = None
+                self._goto("RUN", "cube lost by the ultrasonic sensor")
+            return
+        self.cube["t_seen"] = now
+        if togo <= abs(sp or 0.0) * U["latency_s"]:
+            if togo < -U["overshoot_cm"]:
+                self.counts["missed"] += 1
+                self.cube["cls"] = "missed"
+                self._finish("missed")
+                return self._goto("RUN", "missed cube (ultrasonic)")
+            self.cube.update(us_err_cm=round(togo, 1))
+            self._stop_to_classify(now)
+
+    def _stop_to_classify(self, now):
+        self._belt("S")
+        self.cube.update(t_stop_cmd=now)
+        self.vote, self.face, self.probs = self.new_voter(), None, None
+        self._seen_probs = []
+        self._goto("CLASSIFYING", f"cube #{self.cube['id']} at the classification point")
 
     def _s_classifying(self, now, det, sp):
         c = self.cube
@@ -271,12 +394,19 @@ class Orchestrator:
         t_ready = max(t_settle, c["t_stopped"] + 0.2)
         if now < t_ready or det is None or det["t"] < t_ready - 0.05:
             if now - t_ready > C["classify_timeout_s"]:
-                return self._decide(now, "dudoso", "classification timeout")
+                return self._timeout_decision(now)
             return
-        c.setdefault("x_final_px", round(det["s"], 1))   # where the cube really stopped (tune stop_latency_s)
+        if "x_final_px" not in c and "us_final_cm" not in c:   # where the cube really stopped (tune the latencies)
+            if c.get("src") == "ultrasonic":
+                togo = self.us_to_go(C["ultrasonic"]["classify_cm"])
+                if togo is not None:
+                    c["us_final_cm"] = round(togo, 1)
+            elif "s" in det:                                  # status "none" has no position
+                c["x_final_px"] = round(det["s"], 1)
         if det["status"] == "ok":
             self.face = cv2.cvtColor(det["crop"], cv2.COLOR_BGR2RGB)
             self.probs = self.model.predict(self.face)
+            self._seen_probs.append(np.asarray(self.probs, float))
             v = self.vote.update(True, self.probs, (det["cx"], det["cy"]))
         else:
             v = self.vote.update(False)
@@ -284,7 +414,17 @@ class Orchestrator:
         if v["decision"]:
             return self._decide(now, v["decision"], v["reason"])
         if now - t_ready > C["classify_timeout_s"]:
-            self._decide(now, "dudoso", "classification timeout")
+            self._timeout_decision(now)
+
+    def _timeout_decision(self, now):
+        """Not enough frames in time: decide with the faces seen so far (highest mean probability)."""
+        if C.get("uncertain", False):
+            return self._decide(now, "dudoso", "classification timeout")
+        if not self._seen_probs:
+            return self._decide(now, "other", "timeout: no face seen")
+        m = np.mean(self._seen_probs, axis=0)
+        best = int(m.argmax())
+        self._decide(now, self.classes[best], f"timeout: highest mean p {m[best]:.2f} of {len(self._seen_probs)} frames")
 
     def _decide(self, now, cls, why):
         c = self.cube
@@ -292,25 +432,45 @@ class Orchestrator:
                  conf=float(self.probs.max()) if self.probs is not None else None,
                  probs=[round(float(x), 3) for x in self.probs] if self.probs is not None else None)
         self.counts[cls] += 1
-        routine = A["routines"].get(cls)
-        c["routine"] = routine
-        self.plant.publish(dict(event="decision", id=c["id"], cls=cls, why=why, conf=c["conf"], routine=routine))
-        state.log(f"Cycle: cube #{c['id']} = {cls} ({why}) -> {routine or 'belt end'}")
+        push = C["push"].get(cls)
+        routine = push["routine"] if push else None
+        reverse = not push and cls in C["reverse_classes"]
+        c.update(routine=routine, target_cm=push["cm"] if push else None, us_target_cm=(push or {}).get("us_cm"))
+        dest = routine or ("back to the origin" if reverse else "to the end basket")
+        self.plant.publish(dict(event="decision", id=c["id"], cls=cls, why=why, conf=c["conf"], routine=routine,
+                                dest=dest))
+        state.log(f"Cycle: cube #{c['id']} = {cls} ({why}) -> {dest}")
         if routine and self.plant.live() and self.arm_online is False:
             return self._fault("robotic arm offline")
         c["travel0"] = self.plant.travel()
-        self.plant.belt("F", C["run_speed_pct"])
-        self._goto("TO_ARM" if routine else "TO_END", routine or "to the end basket")
+        self._belt("R" if reverse else "F", C["run_speed_pct"])
+        self._goto("TO_ARM" if routine else "REVERSE" if reverse else "TO_END", dest)
 
     def _s_to_arm(self, now, det, sp):
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
-        dist = abs(self.plant.travel() - self.cube["travel0"])
-        if dist >= C["arm_distance_cm"] - abs(sp or 0.0) * C["stop_latency_s"]:
-            self.plant.belt("S")
+        c = self.cube
+        dist = abs(self.plant.travel() - c["travel0"])
+        togo = None
+        if c.get("src") == "ultrasonic" and c.get("us_target_cm") is not None:
+            togo = self.us_to_go(c["us_target_cm"])
+            if togo is not None:
+                c["arm_by"] = "ultrasonic"
+                c.pop("us_lost", None)
+            elif not c.get("us_lost"):
+                c["us_lost"] = True
+                state.log(f"Cycle: ultrasonic lost cube #{c['id']} on its way to the arm - using the encoder", "warn")
+        if togo is not None:
+            arrived = togo <= abs(sp or 0.0) * C["ultrasonic"]["latency_s"]
+        else:
+            c["arm_by"] = "encoder"
+            arrived = dist >= c["target_cm"] - abs(sp or 0.0) * C["stop_latency_s"]
+        if arrived:
+            self._belt("S")
             self.cube.update(t_arm_stop_cmd=now)
             self._push_sent = False
             self._push_seen_start = False
+            self._homing = self._home_seen = False
             self._goto("PUSHING", f"{self.cube['routine']} for cube #{self.cube['id']}")
 
     def _s_pushing(self, now, det, sp):
@@ -322,6 +482,8 @@ class Orchestrator:
             if not stopped:
                 return self._fault("belt did not stop at the arm")
             c["arm_travel_cm"] = round(abs(self.plant.travel() - c["travel0"]), 2)   # where it really stopped
+            if self.us is not None:
+                c["arm_us_cm"] = round(self.us, 1)
             if not self.plant.send_arm(c["routine"]):
                 return self._fault("MQTT broker unreachable: push not sent")
             c["t_push_cmd"] = now
@@ -330,15 +492,47 @@ class Orchestrator:
                 self._sim_done_at = now + C["sim_push_s"]
             return
         if not self.plant.live() and now >= self._sim_done_at:
-            return self._pushed(now)
-        if now - c["t_push_cmd"] > A["timeout_s"]:
+            return self._pushed(now) if self._homing else self._push_done(now)
+        if self._homing:
+            if now - c["t_home_cmd"] > A["timeout_s"]:
+                return self._fault(f"arm did not reach HOME within {A['timeout_s']:.0f} s")
+        elif now - c["t_push_cmd"] > A["timeout_s"]:
             return self._fault(f"arm did not finish {c['routine']} within {A['timeout_s']:.0f} s")
 
-    def _pushed(self, now):
+    def _push_done(self, now):
+        """Push routine finished: send the arm HOME (and wait for it) before the belt moves again."""
         self.cube["t_arm_done"] = now
+        if not A.get("home_after_push", True):
+            return self._pushed(now)
+        if not self.plant.send_arm(A["home_cmd"]):
+            return self._fault("MQTT broker unreachable: HOME not sent")
+        self.cube["t_home_cmd"] = now
+        self._homing, self._home_seen = True, False
+        self.msg = f"{self.cube['routine']} done, arm going HOME"
+        if not self.plant.live():
+            self._sim_done_at = now + C["sim_home_s"]
+
+    def _pushed(self, now):
+        if self._homing:
+            self.cube["t_home_done"] = now
         self._finish("pushed")
-        self.plant.belt("F", C["run_speed_pct"])
+        self._belt("F", C["run_speed_pct"])
         self._goto("RUN", "push done")
+
+    def _s_reverse(self, now, det, sp):
+        if self._stalled(now):
+            return self._fault("belt not moving (stall)")
+        dist = abs(self.plant.travel() - self.cube["travel0"])
+        if self._src() == "ultrasonic":             # the sensor sees the cube leave the belt at the origin
+            by_cm = self.us is None or cfg.us_position_cm(self.us) is None
+        else:
+            by_cm = C["reverse_cm"] is not None and dist >= C["reverse_cm"]
+        by_time = C["reverse_s"] is not None and now - self.since >= C["reverse_s"]
+        if (by_cm and now - self.since > 0.5) or by_time:
+            self.cube["reverse_cm"] = round(dist, 2)
+            self._finish("returned to origin")
+            self._belt("F", C["run_speed_pct"])
+            self._goto("RUN", f"cube left the belt at the origin ({dist:.0f} cm, {now - self.since:.1f} s)")
 
     def _s_to_end(self, now, det, sp):
         if self._stalled(now):
@@ -355,10 +549,15 @@ class Orchestrator:
                 continue
             if text.startswith(A["error_prefix"]):
                 return self._fault(f"arm error: {text}")
-            if self.cube["routine"] in text.upper():
+            if self._homing:                        # "OK HOME -> ..." / "OK -> (...)": the arm took our HOME
+                if text.startswith("OK"):
+                    self._home_seen = True
+                elif text == A["done_text"] and self._home_seen:
+                    return self._pushed(now)
+            elif self.cube["routine"] in text.upper():
                 self._push_seen_start = True        # "PUSH1 inicio": the arm took OUR command
             elif text == A["done_text"] and self._push_seen_start:
-                return self._pushed(now)
+                return self._push_done(now)
 
     # ── bookkeeping ─────────────────────────────────────────────────────────────────────────
     def _goto(self, new, msg=""):
@@ -367,7 +566,7 @@ class Orchestrator:
         self.plant.publish(dict(event="state", state=new, msg=msg, t=self.since))
 
     def _fault(self, why):
-        self.plant.belt("S", force=True)
+        self._belt("S", force=True)
         if self.state == "PUSHING" or self.plant.live():
             self.plant.send_arm("STOP")
         self.counts["faults"] += 1
@@ -385,6 +584,8 @@ class Orchestrator:
             lat["classify_s"] = c["t_decision"] - c["t_stop_cmd"]
         if "t_push_cmd" in c and "t_arm_done" in c:
             lat["arm_s"] = c["t_arm_done"] - c["t_push_cmd"]
+        if "t_home_cmd" in c and "t_home_done" in c:
+            lat["home_s"] = c["t_home_done"] - c["t_home_cmd"]
         lat["cycle_s"] = self.clock() - c["t_detect"]
         c["latency"] = {k: round(v, 3) for k, v in lat.items()}
         c["deadline_miss"] = [k for k, lim in C["deadlines"].items() if k in lat and lat[k] > lim]
@@ -400,9 +601,15 @@ class Orchestrator:
         if not path:
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        cols = ["time", "id", "cls", "conf", "why", "routine", "outcome", "stop_s", "classify_s", "arm_s", "cycle_s",
-                "x_cmd_px", "x_final_px", "arm_travel_cm", "deadline_miss", "probs"]
+        cols = ["time", "id", "cls", "conf", "why", "routine", "outcome", "stop_s", "classify_s", "arm_s", "home_s", "cycle_s",
+                "src", "x_cmd_px", "x_final_px", "us_err_cm", "us_final_cm", "target_cm", "arm_travel_cm", "us_target_cm",
+                "arm_us_cm", "arm_by", "reverse_cm", "deadline_miss", "probs"]
         new = not os.path.exists(path)
+        if not new:                                 # columns changed since the file was started: keep it aside
+            with open(path) as f:
+                if f.readline().strip() != ",".join(cols):
+                    os.replace(path, path.replace(".csv", time.strftime("_old_%Y%m%d_%H%M%S.csv")))
+                    new = True
         try:
             with open(path, "a", newline="") as f:
                 w = csv.writer(f)
@@ -411,7 +618,9 @@ class Orchestrator:
                 lat = c.get("latency", {})
                 w.writerow([time.strftime("%Y-%m-%d %H:%M:%S"), c["id"], c.get("cls"), c.get("conf"), c.get("why"),
                             c.get("routine"), c["outcome"], lat.get("stop_s"), lat.get("classify_s"), lat.get("arm_s"),
-                            lat.get("cycle_s"), c.get("x_err_px"), c.get("x_final_px"), c.get("arm_travel_cm"),
+                            lat.get("home_s"), lat.get("cycle_s"), c.get("src"), c.get("x_err_px"), c.get("x_final_px"), c.get("us_err_cm"),
+                            c.get("us_final_cm"), c.get("target_cm"), c.get("arm_travel_cm"), c.get("us_target_cm"),
+                            c.get("arm_us_cm"), c.get("arm_by"), c.get("reverse_cm"),
                             ";".join(c.get("deadline_miss", [])), c.get("probs")])
         except OSError as e:
             state.log(f"Cycle log not written: {e}", "warn")
@@ -424,7 +633,7 @@ class Orchestrator:
                         face=self.face, probs=None if self.probs is None else list(self.probs),
                         vote=self.vote.view() if self.vote is not None and self.state == "CLASSIFYING" else None,
                         arm_online=self.arm_online, arm_last=self.arm_last, live=self.plant.live(),
-                        classes=self.classes)
+                        classes=self.classes, src=self.plant.position_source(), us=self.us)
 
     def draw(self, img):
         """Video overlay: stop line, the face found and its corners, current state."""
@@ -437,9 +646,7 @@ class Orchestrator:
                 col = {"CLASSIFYING": (0, 200, 255), "OBJECT_DETECTED": (60, 200, 60)}.get(self.state, (200, 200, 200))
                 cv2.polylines(img, [np.asarray(d["corners"], np.int32)], True, col, 2, cv2.LINE_AA)
             txt = self.state + (f"  #{self.cube['id']}" if self.cube else "")
-            if self.cubes and self.state in ("TO_ARM", "PUSHING", "TO_END"):
-                txt += f"  {self.cubes[0].get('cls', '')}"
-            elif self.cube and self.cube.get("cls"):
+            if self.cube and self.cube.get("cls"):
                 txt += f"  {self.cube['cls']}"
             cv2.putText(img, txt, (xs + 6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
             cv2.putText(img, txt, (xs + 6, 16), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 220, 255), 1, cv2.LINE_AA)

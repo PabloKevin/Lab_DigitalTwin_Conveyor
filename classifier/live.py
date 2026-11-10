@@ -48,10 +48,12 @@ def best_model():
 
 class Voter:
     """Decision rule over consecutive frames of ONE object (ported 1:1 to the firmware later).
-    update() per frame -> dict(state, votes, decision, reason)."""
+    update() per frame -> dict(state, votes, decision, reason).
+    uncertain=False: no "dudoso" - the decision is simply the class with the highest mean probability."""
 
-    def __init__(self, classes, n_frames, min_agree, tau, lost_frames=3, jump_px=60):
+    def __init__(self, classes, n_frames, min_agree, tau, lost_frames=3, jump_px=60, uncertain=True):
         self.classes, self.n, self.k, self.tau = classes, n_frames, min_agree, tau
+        self.uncertain = uncertain
         self.lost_frames, self.jump_px = lost_frames, jump_px
         self.reset()
 
@@ -81,6 +83,12 @@ class Voter:
         win, cnt = Counter(votes.tolist()).most_common(1)[0]
         conf = float(P[votes == win, win].mean())
         name = self.classes[win]
+        if not self.uncertain:
+            m = P.mean(0)
+            best = int(m.argmax())
+            self.decision = self.classes[best]
+            self.reason = f"highest mean p {m[best]:.2f} ({int((votes == best).sum())}/{len(votes)} votes)"
+            return
         if cnt < self.k:
             self.decision, self.reason = "dudoso", f"only {cnt}/{self.n} agree"
         elif conf < self.tau:

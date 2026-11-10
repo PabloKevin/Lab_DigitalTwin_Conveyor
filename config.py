@@ -287,6 +287,11 @@ CONTROLS = [
          options=[("Camera", "camera"), ("Ultrasonic", "ultrasonic")], default="camera",
          target="twin", model_var="pos_source"),
 
+    # Sorting cycle: where the cube position comes from (shown inside the "Sorting cycle" card):
+    dict(id="cycle_source", group="Sorting cycle", label="Stop positions from", kind="buttons",
+         options=[("Camera", "camera"), ("Ultrasonic", "ultrasonic")], default="camera",
+         target="twin", model_var="cycle_source"),
+
     # Twin-only "what-if / fault injection" (lab guide section 5.3):
     dict(id="fault_loss", group="Twin what-if", label="Inject speed loss (twin only)", unit="%", kind="slider",
          min=0, max=60, step=1, default=0, target="twin", model_var="fault_loss_pct"),
@@ -352,23 +357,50 @@ ESTOP = dict(control="direction", value="S")
 
 # ════════════════════════════════════════════════════════════════════════════
 # CLASSIFICATION CYCLE (orchestrator.py) - the automatic sorting state machine
-#   IDLE -> RUN -> OBJECT_DETECTED -> CLASSIFYING -> (TO_ARM -> PUSHING) or TO_END -> RUN ...
+#   IDLE -> RUN -> OBJECT_DETECTED -> CLASSIFYING -> TO_ARM -> PUSHING -> RUN       (classes in push=)
+#                                                 \-> REVERSE (back to the origin) -> RUN   (reverse_classes=)
 #   any fault / E-stop -> SAFE_STOP (belt stopped, arm STOP) until "Reset" on the page
 # One cube at a time between the camera and the arm. Distances in cm of belt travel (encoder).
 # ════════════════════════════════════════════════════════════════════════════
 CYCLE = dict(
     model="classifier/models/cube_classifier.npz",   # NumPy CNN (python -m classifier.export, then copy here)
+    # Where the cube is: "camera" (stop line in the image + encoder to the arm) or "ultrasonic" (HC-SR04 readings,
+    # stops at the sensor distances below). Default only - switch it live in the page's "Sorting cycle" card.
+    position_source="camera",
+    ultrasonic=dict(
+        classify_cm=30.0,      # <<< MEASURE: sensor reading with the cube centred under the camera (classification)
+        arm_margin_cm=4.0,     # a cube must be at least this far before the classification point to be armed
+        overshoot_cm=8.0,      # found this far past the point before stopping -> missed
+        latency_s=0.35,        # telemetry period (0.1 s) + median + command + motor stop; the stop is sent this early.
+                               # TUNE with logs/cycles.csv: us_final_cm and arm_us_cm - us_target_cm should be ~0
+        median_n=3,            # median of this many readings (HC-SR04 jitter)
+    ),
     run_speed_pct=25,          # belt speed while the cycle runs (% of MAX_RPM)
     stop_x_frac=0.5,           # stop when the cube centre reaches this fraction of the image width (0.5 = middle)
     arm_margin_px=40,          # a cube must be seen at least this far BEFORE the stop line to be armed (no re-trigger)
     stop_latency_s=0.25,       # frame age + command + motor stop; the stop command is sent this much earlier.
-                               # TUNE with logs/cycles.csv: x_final_px (camera) and arm_travel_cm - arm_distance_cm
+                               # TUNE with logs/cycles.csv: x_final_px (camera) and arm_travel_cm - target_cm
                                # (arm) should be ~0; positive = stopped too late -> increase, negative -> decrease
     overshoot_px=80,           # cube found this far PAST the line before stopping -> missed (goes to the end)
     settle_s=0.6,              # wait after stopping before taking the classification frames (no motion blur)
-    classify_timeout_s=4.0,    # no decision within this time (after settle) -> dudoso
-    arm_distance_cm=20.0,      # <<< MEASURE: belt distance from the stop line (image centre) to the arm's push point
-    clear_cm=12.0,             # cubes that are not pushed: belt travel before looking for the next cube
+    classify_timeout_s=4.0,    # not enough frames within this time (after settle) -> decide with the faces seen
+                               # so far (none seen -> "other")
+    uncertain=False,           # False: the class is simply the highest mean probability over the frames.
+                               # True: old rule with "dudoso" (low confidence / no majority, params.json "decision")
+    # Push positions: class -> arm routine and where the cube must stop so that routine hits it:
+    #   cm     camera mode: belt travel (encoder) from the camera stop line (image centre) to the push point
+    #   us_cm  ultrasonic mode: sensor reading with the cube at the push point  <<< MEASURE (page: "Distance (ultrasonic)")
+    push={
+        "solid":   dict(routine="PUSH1", cm=2.0, us_cm=19.0),
+        "stripes": dict(routine="PUSH2", cm=7.0, us_cm=15.0),
+        "corners": dict(routine="PUSH3", cm=15.0, us_cm=10.0),
+    },
+    # Classes sent back to the origin: belt reverses until the cube has left the belt, then forward again.
+    reverse_classes=("other", "dudoso"),
+    reverse_cm=30.0,           # <<< MEASURE: stop line -> origin end of the belt + a few cm (None = time only).
+                               # Ultrasonic mode: done when the sensor sees the cube past the belt start instead
+    reverse_s=5.0,             # ...or this long in reverse, whichever comes first (None = distance only)
+    clear_cm=12.0,             # any class in neither list: belt travel before looking for the next cube (belt end)
     stopped_cm_s=0.8,          # |belt speed| below this = stopped
     stop_timeout_s=3.0,        # stop commanded, measured speed still above stopped_cm_s after this -> fault.
                                # The Arduino reports a FILTERED speed (EMA 0.2/0.8 at 10 Hz, 0 only after 400 ms
@@ -377,6 +409,7 @@ CYCLE = dict(
     camera_timeout_s=2.0,      # no camera frame for this long while running -> fault
     telemetry_timeout_s=2.0,   # no conveyor telemetry for this long (Live sync) -> fault
     sim_push_s=2.5,            # Sandbox: the arm is simulated, "push" takes this long
+    sim_home_s=1.0,            # ...and HOME this long
     log_csv="logs/cycles.csv", # one line per cube (times, class, latencies, deadline checks)
     publish_topic=f"{TOPIC_PREFIX}/cycle",   # state + every decision are published here (JSON)
     # Deadlines (lab section 6.1) checked for every cube; a miss is logged as a warning and counted
@@ -388,10 +421,11 @@ CYCLE = dict(
 # Robotic arm (EEZYbotARM Mk2, firmware coppeliaSim_panaderia_ws/firmware/esp32_eezybot_linear): plain-text MQTT.
 # Its MQTT_HOST must be this PC's IP (mosquitto.conf listens on the LAN).
 ARM = dict(
-    cmd_topic="eezybot/cmd",         # we send "PUSH1" / "PUSH2" / "STOP"
+    cmd_topic="eezybot/cmd",         # we send the routine of CYCLE["push"] ("PUSH1" / "PUSH2" / "PUSH3") or "STOP"
     status_topic="eezybot/status",   # it answers "PUSH1 inicio", "DONE", "IDLE" (routine finished), "ERR ..."
     online_topic="eezybot/online",   # retained "1" / "0"
-    routines={"solid": "PUSH1", "stripes": "PUSH2"},   # class -> routine; other classes / dudoso go to the belt end
+    home_after_push=True,            # after each push send home_cmd and wait for it before the belt moves again
+    home_cmd="HOME",
     done_text="IDLE",
     error_prefix="ERR",
     timeout_s=15.0,                  # push sent, no IDLE within this time -> fault
