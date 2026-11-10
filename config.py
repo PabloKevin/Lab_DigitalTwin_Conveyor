@@ -108,7 +108,7 @@ VISION = dict(
     # Both the Arduino and the ESP32-CAM-MB are CH340 -> /dev/ttyUSB0/1 can swap between reboots; the stable names are
     # in /dev/serial/by-id/ (ls -l /dev/serial/by-id) - but two CH340s look alike there too, so the safest check is
     # the "[info] ESP32-CAM: ready ..." line at startup. Without a camera: python sim_camserial.py -> serial:/dev/pts/N
-    camera_url="serial:/dev/ttyUSB0",
+    camera_url="serial:/dev/ttyUSB0@921600",
     # --- WiFi alternative (firmware/esp32_cam/esp32cam_stream.ino): set camera_url to the HTTP stream instead ---
     # ESP32-CAM firmware: stream on port 81, settings endpoint /control on port 80 (also accepts a video file or 0 = webcam).
     # Using the ESP32-CAM's real IP instead of esp32cam.local (mDNS) - avoids depending on avahi-daemon/
@@ -372,7 +372,7 @@ CYCLE = dict(
     # stops at the sensor distances below). Default only - switch it live in the page's "Sorting cycle" card.
     position_source="camera",
     ultrasonic=dict(
-        classify_cm=30.0,      # <<< MEASURE: sensor reading with the cube centred under the camera (classification)
+        classify_cm=38.0,      # <<< MEASURE: sensor reading with the cube centred under the camera (classification)
         arm_margin_cm=4.0,     # a cube must be at least this far before the classification point to be armed
         overshoot_cm=8.0,      # found this far past the point before stopping -> missed
         latency_s=0.35,        # telemetry period (0.1 s) + median + command + motor stop; the stop is sent this early.
@@ -395,15 +395,15 @@ CYCLE = dict(
     #   cm     camera mode: belt travel (encoder) from the camera stop line (image centre) to the push point
     #   us_cm  ultrasonic mode: sensor reading with the cube at the push point  <<< MEASURE (page: "Distance (ultrasonic)")
     push={
-        "solid":   dict(routine="PUSH1", cm=6.0, us_cm=19.0),
-        "stripes": dict(routine="PUSH2", cm=15.0, us_cm=15.0),
-        "corners": dict(routine="PUSH3", cm=22.0, us_cm=10.0),
+        "solid":   dict(routine="PUSH1", cm=6.0, us_cm=23.0),
+        "stripes": dict(routine="PUSH2", cm=16.0, us_cm=15.0),
+        "corners": dict(routine="PUSH3", cm=24.0, us_cm=8.0),
     },
     # Classes sent back to the origin: belt reverses until the cube has left the belt, then forward again.
     reverse_classes=("other", "dudoso"),
-    reverse_cm=30.0,           # <<< MEASURE: stop line -> origin end of the belt + a few cm (None = time only).
+    reverse_cm=50.0,           # <<< MEASURE: stop line -> origin end of the belt + a few cm (None = time only).
                                # Ultrasonic mode: done when the sensor sees the cube past the belt start instead
-    reverse_s=5.0,             # ...or this long in reverse, whichever comes first (None = distance only)
+    reverse_s=8.0,             # ...or this long in reverse, whichever comes first (None = distance only)
     # After each push (and HOME): is the cube still at the push point? (camera, or the sensor for ultrasonic cubes)
     verify=dict(
         on=True,

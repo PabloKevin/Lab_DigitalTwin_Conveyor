@@ -36,7 +36,7 @@
 #include <stdarg.h>
 
 // ===================== USER SETTINGS =====================
-#define BAUD          2000000     // CH340 on the ESP32-CAM-MB handles 2 Mbaud; use 921600 if you see many bad packets
+#define BAUD          921600     // CH340 on the ESP32-CAM-MB handles 2 Mbaud; use 921600 if you see many bad packets 2000000
                                   // (and add "@921600" to the PC url: "serial:/dev/ttyUSB0@921600")
 #define FRAME_SIZE    FRAMESIZE_VGA
 #define JPEG_QUALITY  12          // 10 = best/biggest ... 63 = worst/smallest
