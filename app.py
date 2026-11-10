@@ -224,6 +224,14 @@ def cycle_view():
         info.append(html.Div(className="kv", children=[
             html.Span("Ultrasonic", className="k"),
             html.Span(f"{us}  ·  classify at {cfg.CYCLE['ultrasonic']['classify_cm']:g} cm", className="v")]))
+    k = v.get("calib")
+    if k:
+        cube_txt = f" · cube seen {k['cube_cm']:.1f} cm wide" if k.get("cube_cm") else ""
+        info.append(html.Div(className="kv", children=[
+            html.Span("Speed calibration", className="k"),
+            html.Span(f"camera {k['cam_v']:.1f} vs encoder {k['enc_v']:.1f} cm/s → ×{k['ratio']:.2f} (n={k['n']}, twin "
+                      f"uses ×{k['scale']:.2f}) · ROLLER_RADIUS_CM ≈ {k['radius_cm']:.2f} · {k['ppcm']:.1f} px/cm"
+                      f"{cube_txt}", className="v")]))
     cur = v["cube"] or (v["cubes"][0] if v["cubes"] else None)
     body = []
     if cur:

@@ -28,6 +28,7 @@ class FakePlant:
         self.hidden = False                              # camera sees no cube (e.g. occluded)
         self.src = "camera"
         self.push_x = []
+        self.enc_gain = 1.0                              # encoder (roller radius) error: reports gain x real speed
         self.push_fails = 0                              # next pushes that miss the cube
         self.fail_nudge_px = 0.0                         # a missed push moves the cube by this much
         self.filtered = False                            # report speed/travel like the Arduino (hold + EMA)
@@ -41,8 +42,8 @@ class FakePlant:
         if d == "S" and self.ignore_stop and not force:
             return
         self.pending.append((self.t[0] + CMD_DELAY, d))
-    def travel(self): return self.travel_rep if self.filtered else self.travel_
-    def speed(self): return self.vf if self.filtered else self.v
+    def travel(self): return self.enc_gain * (self.travel_rep if self.filtered else self.travel_)
+    def speed(self): return self.enc_gain * (self.vf if self.filtered else self.v)
     def speed_lag(self): return 0.4 if self.filtered else 0.0
     def telemetry_age(self): return 0.0 if self.telemetry else 99.0
     def geometry(self): return PPCM, 1
@@ -106,6 +107,7 @@ class TestOrchestrator(unittest.TestCase):
     def setUp(self):
         self._cycle = copy.deepcopy(cfg.CYCLE)
         cfg.CYCLE["log_csv"] = None
+        cfg.CYCLE["calib_file"] = None
         for cls, cm in (("solid", 15.0), ("stripes", 20.0), ("corners", 25.0)):     # a different stop per class
             cfg.CYCLE["push"][cls]["cm"] = cm
         self.t = [1000.0]
@@ -385,6 +387,23 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(ob["speed_cm_s"], 0.0)
         self.run_until(lambda: False, 1.0)
         self.assertEqual(self.o.objects()[0]["x_cm"], x1)
+
+
+    def test_camera_measures_the_real_belt_speed(self):
+        """Encoder over-reports by 25 % (wrong roller radius): the camera ratio must find it and the twin's cube
+        must follow the real cube, not the encoder."""
+        self.plant.enc_gain = 1.25
+        self.plant.cubes = [-250.0]                      # enters from the left: a long ride to the stop line
+        self.o.start()
+        self.until_state("CLASSIFYING")
+        self.assertEqual(len(self.o.calib), 1)
+        m = self.o.calib[0]
+        self.assertAlmostEqual(m["ratio"], 0.8, delta=0.05)
+        self.assertAlmostEqual(m["cam_v"], V, delta=0.5)
+        self.assertAlmostEqual(self.o.speed_scale(), m["ratio"])
+        self.until_state("PUSHING")
+        self.run_until(lambda: False, 1.0)
+        self.assertAlmostEqual(self.o.objects()[0]["x_cm"], self.plant.push_x[-1] / PPCM, delta=1.0)
 
 
 if __name__ == "__main__":

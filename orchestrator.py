@@ -134,6 +134,8 @@ class Orchestrator:
         self._dir, self._last_travel, self.free_x = "S", None, None   # for the cube position on the twin belt
         self.odo, self._move_dir, self._t_stop = 0.0, "F", -1e9        # belt odometer (see _odometer)
         self._odo_n, self._was_moving, self._last_lead = 0.0, False, 0.0
+        self._t_run_start = -1e9
+        self.calib = deque(self._load_calib(), maxlen=10)   # camera/encoder speed measurements (see _calib_finish)
         self.last_blobs, self.last_x_stop, self._ver = [], None, []
         self._thread = None
 
@@ -202,6 +204,7 @@ class Orchestrator:
             if sp is not None and abs(sp) >= C["stopped_cm_s"]:
                 self.t_moving = now
             self._arm_events(now)
+            self._calib_sample(now, det, sp)
             if self.state not in ("IDLE", "SAFE_STOP"):
                 age = self.plant.telemetry_age()
                 if self.plant.live() and (age is None or age > C["telemetry_timeout_s"]):
@@ -252,7 +255,11 @@ class Orchestrator:
                 dd = self.pp.process(frame, q)
                 if dd.status == "ok":
                     crop, corners = dd.crop, dd.corners
-        self.last_det = dict(status="ok" if crop is not None else "partial", t=t_cap, cx=(x1 + x2) / 2,
+        side_px = None
+        if corners is not None:
+            cc = np.asarray(corners, float)
+            side_px = float(np.mean([np.linalg.norm(cc[i] - cc[(i + 1) % 4]) for i in range(4)]))
+        self.last_det = dict(status="ok" if crop is not None else "partial", t=t_cap, cx=(x1 + x2) / 2, side_px=side_px,
                              cy=(y1 + y2) / 2, s=sv, x_stop=x_stop, ppcm=ppcm, crop=crop, corners=corners, bbox=b["bbox"])
         return self.last_det
 
@@ -283,6 +290,8 @@ class Orchestrator:
 
     def _belt(self, direction, speed_pct=None, force=False):
         if direction in ("F", "R"):
+            if self._dir != direction:
+                self._t_run_start = self.clock()
             self._move_dir = direction
         elif self._dir != "S":
             self._t_stop = self.clock()
@@ -331,7 +340,7 @@ class Orchestrator:
             if meas is not None:
                 self.cube["x_cm"] = meas
             elif self.cube.get("x_cm") is not None:
-                self.cube["x_cm"] += d
+                self.cube["x_cm"] += d * self.speed_scale()
             self.free_x = None
         elif det is not None or self.plant.position_source() == "ultrasonic":
             self.free_x = meas
@@ -340,7 +349,8 @@ class Orchestrator:
         """Cube(s) for the twin's belt drawing / objects table (same fields as vision's objects)."""
         with self.lock:
             sp = self.plant.speed()
-            v = None if sp is None else ({"F": 1, "R": -1}.get(self._dir, 0) * abs(sp) if self.moving() else 0.0)
+            v = None if sp is None else ({"F": 1, "R": -1}.get(self._dir, 0) * abs(sp) * self.speed_scale()
+                                         if self.moving() else 0.0)
             mk = lambda oid, label, x: dict(id=oid, label=label, x_cm=x, speed_cm_s=v, expected_cm=None, err_cm=None,
                                             diverging=False)
             if self.cube is not None and self.cube.get("x_cm") is not None:
@@ -349,6 +359,75 @@ class Orchestrator:
             if self.free_x is not None:
                 return [mk("-", "cube", self.free_x)]
             return []
+
+    # ── speed calibration: camera vs encoder ────────────────────────────────────────────────
+    def _calib_sample(self, now, det, sp):
+        """While a cube rides to the stop line at a steady speed, keep (capture time, x px, side px, encoder speed)."""
+        if self.state != "OBJECT_DETECTED" or self.cube is None or det is None or det.get("side_px") is None:
+            return
+        if self._dir != "F" or now - self._t_run_start < C["calib_settle_s"] or not sp or abs(sp) < C["stopped_cm_s"]:
+            return
+        self.cube.setdefault("track", []).append((det["t"], det["cx"], det["side_px"], abs(sp)))
+
+    def _calib_finish(self):
+        """Cube reached the stop line: camera speed = slope of x px vs time / px per cm of the belt calibration.
+        The cube's size in cm (with that calibration) is kept as a check of the calibration itself."""
+        c = self.cube
+        tr = np.asarray(c.pop("track", []), float)
+        if len(tr) < 4 or tr[-1, 0] - tr[0, 0] < 0.8:
+            return
+        ppcm = self.plant.geometry()[0]
+        cube_cm = float(np.median(tr[:, 2])) / ppcm
+        slope = abs(np.polyfit(tr[:, 0] - tr[0, 0], tr[:, 1], 1)[0])      # px/s
+        cam_v, enc_v = slope / ppcm, float(np.median(tr[:, 3]))
+        if enc_v <= 0 or not (0.3 < cam_v / enc_v < 3.0):
+            state.log(f"Cycle: speed calibration ignored (camera {cam_v:.1f} vs encoder {enc_v:.1f} cm/s)", "warn")
+            return
+        m = dict(t=time.time(), cam_v=round(cam_v, 2), enc_v=round(enc_v, 2), ratio=round(cam_v / enc_v, 3),
+                 cube_cm=round(cube_cm, 2), n=len(tr))
+        c.update(cam_v=m["cam_v"], enc_v=m["enc_v"], speed_ratio=m["ratio"], cube_cm=m["cube_cm"])
+        self.calib.append(m)
+        self._save_calib()
+
+    def speed_scale(self):
+        """Factor from encoder cm to real cm for the twin's cube motion."""
+        sc = C.get("speed_scale", 1.0)
+        if sc == "auto":
+            return float(np.median([m["ratio"] for m in self.calib])) if self.calib else 1.0
+        return float(sc)
+
+    def calib_summary(self):
+        if not self.calib:
+            return None
+        med = lambda k: float(np.median([m[k] for m in self.calib]))
+        ratio = med("ratio")
+        return dict(n=len(self.calib), cam_v=med("cam_v"), enc_v=med("enc_v"), ratio=ratio,
+                    radius_cm=cfg.ROLLER_RADIUS_CM * ratio, cube_cm=med("cube_cm") if all("cube_cm" in m for m in
+                                                                                       self.calib) else None,
+                    ppcm=self.plant.geometry()[0], scale=self.speed_scale())
+
+    def _calib_path(self):
+        f = C.get("calib_file")
+        return os.path.join(ROOT, f) if f else None
+
+    def _load_calib(self):
+        p = self._calib_path()
+        try:
+            with open(p) as f:
+                return json.load(f)[-10:]
+        except (OSError, TypeError, ValueError):
+            return []
+
+    def _save_calib(self):
+        p = self._calib_path()
+        if not p:
+            return
+        try:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                json.dump(list(self.calib), f, indent=1)
+        except OSError as e:
+            state.log(f"Speed calibration not saved: {e}", "warn")
 
     def _src(self):
         return self.cube.get("src", "camera") if self.cube else self.plant.position_source()
@@ -417,6 +496,7 @@ class Orchestrator:
             self._stop_to_classify(now)
 
     def _stop_to_classify(self, now):
+        self._calib_finish()
         self._belt("S")
         self.cube.update(t_stop_cmd=now)
         self.vote, self.face, self.probs = self.new_voter(), None, None
@@ -717,7 +797,7 @@ class Orchestrator:
             self.misses[k] += 1
             state.log(f"Cycle: cube #{c['id']} missed the {k} deadline ({lat[k]:.2f} s > {C['deadlines'][k]} s)", "warn")
         self.cubes.appendleft(c)
-        self.plant.publish(dict(event="cube", **{k: v for k, v in c.items() if k != "votes"}))
+        self.plant.publish(dict(event="cube", **{k: v for k, v in c.items() if k not in ("votes", "track")}))
         self._log_csv(c)
 
     def _log_csv(self, c):
@@ -727,7 +807,8 @@ class Orchestrator:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cols = ["time", "id", "cls", "conf", "why", "routine", "outcome", "stop_s", "classify_s", "arm_s", "home_s", "cycle_s",
                 "src", "x_cmd_px", "x_final_px", "us_err_cm", "us_final_cm", "target_cm", "arm_travel_cm", "us_target_cm",
-                "arm_us_cm", "arm_by", "push_attempts", "verify", "correct_cm", "reverse_cm", "deadline_miss", "probs"]
+                "arm_us_cm", "arm_by", "push_attempts", "verify", "correct_cm", "reverse_cm",
+                "cam_v", "enc_v", "speed_ratio", "cube_cm", "deadline_miss", "probs"]
         new = not os.path.exists(path)
         if not new:                                 # columns changed since the file was started: keep it aside
             with open(path) as f:
@@ -745,7 +826,8 @@ class Orchestrator:
                             lat.get("home_s"), lat.get("cycle_s"), c.get("src"), c.get("x_err_px"), c.get("x_final_px"), c.get("us_err_cm"),
                             c.get("us_final_cm"), c.get("target_cm"), c.get("arm_travel_cm"), c.get("us_target_cm"),
                             c.get("arm_us_cm"), c.get("arm_by"), c.get("push_attempts"), c.get("verify"),
-                            c.get("correct_cm"), c.get("reverse_cm"),
+                            c.get("correct_cm"), c.get("reverse_cm"), c.get("cam_v"), c.get("enc_v"),
+                            c.get("speed_ratio"), c.get("cube_cm"),
                             ";".join(c.get("deadline_miss", [])), c.get("probs")])
         except OSError as e:
             state.log(f"Cycle log not written: {e}", "warn")
@@ -758,7 +840,8 @@ class Orchestrator:
                         face=self.face, probs=None if self.probs is None else list(self.probs),
                         vote=self.vote.view() if self.vote is not None and self.state == "CLASSIFYING" else None,
                         arm_online=self.arm_online, arm_last=self.arm_last, live=self.plant.live(),
-                        classes=self.classes, src=self.plant.position_source(), us=self.us)
+                        classes=self.classes, src=self.plant.position_source(), us=self.us,
+                        calib=self.calib_summary())
 
     def draw(self, img):
         """Video overlay: stop line, the face found and its corners, current state."""

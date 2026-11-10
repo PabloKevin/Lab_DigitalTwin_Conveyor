@@ -135,9 +135,13 @@ VISION = dict(
     # Use CALIBRATION_MARK below (the red square on the belt) as a ground-truth reference while tuning roi_x1/roi_x2:
     # its expected pixel position is drawn on the camera overlay as a yellow marker - move the ROI sliders until
     # the yellow mark lines up with the real red square in the image.
-    # Calibrated on the real belt with the crop OFF (full 640x480 frame): 680 px = 68 cm -> 10 px/cm.
-    # x2 = 680 is past the frame edge on purpose - it sets the scale, the belt's last cm are just out of view.
-    belt_roi_px=(5, 125, 320, 175),
+    # Calibrated 2026-11-10 on the cropped band (640x160) from a camera frame + the cube's size:
+    #   the 6 cm cube is ~60 px wide -> 10 px/cm (same as classifier/params.json crop.px_per_cm);
+    #   the belt's far end (drive roller, 68 cm) is at x ~ 630 px -> belt start = 630 - 680 = -50 px (out of view);
+    #   the belt occupies rows ~10..108 of the band. The page's "Sorting cycle" card shows the px/cm measured from
+    #   the cube - if it differs from (x2 - x1) / 68, re-check x1 / x2 (keep x2 on the roller).
+    # (The old (5, 125, 320, 175) put the image centre at 68 cm: the twin's cube started at the END of the belt.)
+    belt_roi_px=(-50, 10, 630, 108),
     flip_x=False,          # True if the camera sees the belt mirrored (forward = towards the left)
     speed_window_s=1.0,    # window used to fit each object's speed
     lost_after_s=1.5,      # forget a track not seen for this long
@@ -391,9 +395,9 @@ CYCLE = dict(
     #   cm     camera mode: belt travel (encoder) from the camera stop line (image centre) to the push point
     #   us_cm  ultrasonic mode: sensor reading with the cube at the push point  <<< MEASURE (page: "Distance (ultrasonic)")
     push={
-        "solid":   dict(routine="PUSH1", cm=2.0, us_cm=19.0),
-        "stripes": dict(routine="PUSH2", cm=23.0, us_cm=15.0),
-        "corners": dict(routine="PUSH3", cm=28.0, us_cm=10.0),
+        "solid":   dict(routine="PUSH1", cm=6.0, us_cm=19.0),
+        "stripes": dict(routine="PUSH2", cm=15.0, us_cm=15.0),
+        "corners": dict(routine="PUSH3", cm=22.0, us_cm=10.0),
     },
     # Classes sent back to the origin: belt reverses until the cube has left the belt, then forward again.
     reverse_classes=("other", "dudoso"),
@@ -412,6 +416,12 @@ CYCLE = dict(
         in_sandbox=False,      # Sandbox: the arm is simulated, the cube never really leaves -> skip the check
     ),
     failed_reverse_s=7.0,      # every push failed: belt in reverse for this long (no distance check), then forward
+    # Belt speed seen by the camera (cube tracked while it rides to the stop line, px -> cm with VISION belt_roi_px)
+    # vs the encoder speed: their ratio is shown on the page and, with "auto", scales the twin's cube motion.
+    # The push distances (push[...]["cm"]) stay in ENCODER cm - they were tuned with it.
+    calib_settle_s=1.0,        # ignore the first second after the belt starts (accelerating)
+    speed_scale="auto",        # "auto" = median of the last measured camera/encoder ratios, or a fixed number, or 1.0
+    calib_file="logs/speed_calibration.json",   # measured ratios are kept here between runs
     coast_s=0.3,               # the belt still moves this long after a stop command (serial + motor stopping);
                                # after that a stopped belt does not move the twin's cube / the odometer
     speed_lag_s=0.4,           # lag of the Arduino's filtered speed (EMA 0.2/0.8 at 10 Hz -> 0.1*0.8/0.2 s): the

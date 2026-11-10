@@ -451,6 +451,7 @@ class BgSubVision(VisionBase):
 
     def _detect(self, frame, backsub, tracker, kernel):
         x1, y1, x2, y2 = [int(v) for v in roi()]
+        x1, y1 = max(0, x1), max(0, y1)                 # the belt start/end may lie outside the image
         belt = frame[y1:y2, x1:x2]
         self.blobs = []
         if belt.size == 0:
@@ -463,7 +464,7 @@ class BgSubVision(VisionBase):
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         hsv = cv2.cvtColor(belt, cv2.COLOR_BGR2HSV)
-        px_per_cm = max(1.0, x2 - x1) / L
+        px_per_cm = max(1.0, roi()[2] - roi()[0]) / L
         boxes, labels = [], {}
         for c in contours:
             area = cv2.contourArea(c)
