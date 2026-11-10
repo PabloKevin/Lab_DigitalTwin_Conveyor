@@ -96,7 +96,9 @@ IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED --centre
                    with the highest mean probability - no "dudoso" unless CYCLE["uncertain"] = True)
         solid / stripes / corners --> TO_ARM (belt runs CYCLE["push"][class]["cm"] by encoder) --> stop -->
                             PUSHING: MQTT eezybot/cmd "PUSH1" / "PUSH2" / "PUSH3", wait for "IDLE",
-                            then "HOME", wait for "IDLE" --> RUN
+                            then "HOME", wait for "IDLE" --> VERIFY: cube still at the push point?
+                            no --> RUN;  yes --> CORRECTING (belt puts it back on the push point) --> push again;
+                            still there --> REVERSE for CYCLE["failed_reverse_s"] (7 s) --> RUN
         other --> REVERSE (belt backwards until the cube left the belt at the origin:
                             reverse_cm of travel or reverse_s, whichever first) --> forward again --> RUN
   any fault (telemetry / camera lost, belt not stopping or stalled, arm ERR / timeout / offline) or E-stop
@@ -115,6 +117,8 @@ IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED --centre
   per class, `push[cls]["us_cm"]` (cube at the push point); reverse ends when the sensor sees the cube past the belt
   start. Measure them by placing the cube there and reading "Distance (ultrasonic)". If the sensor loses the cube on
   the way to the arm the encoder distance (`cm`) is used. The camera is still what classifies.
+* Belt distances use an odometer that freezes when the belt is stopped (the Arduino's filtered speed would keep
+  adding travel for ~1 s) and compensates the filter lag: `CYCLE["coast_s"]`, `CYCLE["speed_lag_s"]`.
 * While the cycle runs, the belt drawing shows the cube being handled with its class (camera / sensor position,
   then encoder dead-reckoning after it leaves the camera).
 * Every cube: one line in `logs/cycles.csv` (class, confidence, routine, outcome, stop / classify / arm / cycle

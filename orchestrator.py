@@ -10,7 +10,10 @@ orchestrator.py - the automatic sorting cycle (lab 03 state machine), run by the
         (CYCLE["uncertain"] = True brings back the "dudoso" rule of classifier.live.Voter)-->
           class in config.CYCLE["push"] --> TO_ARM: belt runs that class's cm (encoder) --> stop
                 --> PUSHING: MQTT routine ("PUSH1"/"PUSH2"/"PUSH3") to the arm, wait for "IDLE",
-                    then "HOME" (ARM["home_after_push"]), wait for "IDLE" --> RUN
+                    then "HOME" (ARM["home_after_push"]), wait for "IDLE"
+                --> VERIFY: is the cube still at the push point (camera or ultrasonic)?  no --> RUN
+                    yes (push failed) --> CORRECTING: belt moves the cube back onto the push point --> PUSHING again
+                    failed again (CYCLE["verify"]["attempts"]) --> REVERSE for failed_reverse_s --> RUN
           class in CYCLE["reverse_classes"] (other, dudoso) --> REVERSE: belt runs backwards until the cube has left
                 the belt at the origin (reverse_cm of travel or reverse_s, whichever first) --> forward again, RUN
           any other class --> TO_END: belt runs clear_cm --> RUN (the cube rides to the end basket)
@@ -39,7 +42,8 @@ from state import state
 
 C, A = cfg.CYCLE, cfg.ARM
 ROOT = os.path.dirname(os.path.abspath(__file__))
-STATES = ["IDLE", "RUN", "OBJECT_DETECTED", "CLASSIFYING", "TO_ARM", "PUSHING", "REVERSE", "TO_END", "SAFE_STOP"]
+STATES = ["IDLE", "RUN", "OBJECT_DETECTED", "CLASSIFYING", "TO_ARM", "PUSHING", "VERIFY", "CORRECTING", "REVERSE",
+          "TO_END", "SAFE_STOP"]
 
 
 class Plant:
@@ -62,6 +66,10 @@ class Plant:
 
     def speed(self):
         return state.get("belt_speed_cm_s" if state.sync else "model_belt_speed_cm_s")
+
+    def speed_lag(self):
+        """Lag (s) of the reported speed behind the real belt: the Arduino's EMA; the Sandbox model has none."""
+        return C["speed_lag_s"] if state.sync else 0.0
 
     def telemetry_age(self):
         return state.age("rpm")
@@ -124,6 +132,9 @@ class Orchestrator:
         self.us = None                             # filtered ultrasonic distance (cm), None = nothing / no data
         self._us_hist, self._us_t = deque(maxlen=C["ultrasonic"]["median_n"]), None
         self._dir, self._last_travel, self.free_x = "S", None, None   # for the cube position on the twin belt
+        self.odo, self._move_dir, self._t_stop = 0.0, "F", -1e9        # belt odometer (see _odometer)
+        self._odo_n, self._was_moving, self._last_lead = 0.0, False, 0.0
+        self.last_blobs, self.last_x_stop, self._ver = [], None, []
         self._thread = None
 
     # ── commands from the page (thread-safe) ───────────────────────────────────────────────
@@ -187,7 +198,7 @@ class Orchestrator:
             det = self._new_detection(now)
             self._us_update(now)
             sp = self.plant.speed()
-            self._track_position(det)
+            self._track_position(det, self._odometer(now))
             if sp is not None and abs(sp) >= C["stopped_cm_s"]:
                 self.t_moving = now
             self._arm_events(now)
@@ -215,6 +226,9 @@ class Orchestrator:
         ppcm, sign = self.plant.geometry()
         H, W = frame.shape[:2]
         x_stop = W * C["stop_x_frac"]
+        self.last_x_stop = x_stop
+        self.last_blobs = [((b["bbox"][0] + b["bbox"][2]) / 2, (b["bbox"][1] + b["bbox"][3]) / 2)
+                           for b in d.blobs if b["why"] in ("", "edge", "rect", "corners")]   # for VERIFY
         cands = []
         for b in d.blobs:
             if b["why"] in ("", "edge"):
@@ -268,16 +282,43 @@ class Orchestrator:
         return -cfg.ULTRASONIC["facing"] * (self.us - target_cm)
 
     def _belt(self, direction, speed_pct=None, force=False):
+        if direction in ("F", "R"):
+            self._move_dir = direction
+        elif self._dir != "S":
+            self._t_stop = self.clock()
         self._dir = direction
         self.plant.belt(direction, speed_pct, force=force)
 
-    def _track_position(self, det):
-        """Belt position (cm) of the cube being handled, for the twin's belt drawing: measured while the camera /
-        sensor sees it, otherwise dead-reckoned from the encoder travel in the commanded direction."""
+    def moving(self, now=None):
+        """Belt commanded to run, or stopped less than coast_s ago (motor still stopping)."""
+        now = self.clock() if now is None else now
+        return self._dir != "S" or now - self._t_stop < C["coast_s"]
+
+    def _odometer(self, now):
+        """Signed belt travel (cm, + = forward) estimated from the encoder.
+        The Arduino's speed is filtered (EMA, lag ~speed_lag_s; held 400 ms after the last pulse), so its integral
+        lags the real belt while running and keeps growing for ~1 s after a real stop - that made the twin's cube (and
+        the arm distances) run on after every stop. Here: filtered travel is counted only while the belt runs or
+        coasts (coast_s after a stop command), plus lag * speed while moving (first-order lag compensation), frozen
+        when it stops."""
         travel = self.plant.travel()
         moved = 0.0 if self._last_travel is None else abs(travel - self._last_travel)
         self._last_travel = travel
-        sign = {"F": 1.0, "R": -1.0}.get(self._dir, 0.0)
+        sgn = 1.0 if self._move_dir == "F" else -1.0
+        mv = self.moving(now)
+        lead = sgn * self.plant.speed_lag() * abs(self.plant.speed() or 0.0)
+        if mv:
+            self._odo_n += sgn * moved
+        elif self._was_moving:
+            self._odo_n += self._last_lead           # bake the lag compensation in at the stop
+        self._was_moving = mv
+        self._last_lead = lead if mv else 0.0
+        old, self.odo = self.odo, self._odo_n + self._last_lead
+        return self.odo - old
+
+    def _track_position(self, det, d):
+        """Belt position (cm) of the cube being handled, for the twin's belt drawing: measured while the camera /
+        sensor sees it, otherwise dead-reckoned with the odometer (which does not move while the belt is stopped)."""
         meas = None
         if self.plant.position_source() == "ultrasonic" or (self.cube and self.cube.get("src") == "ultrasonic"):
             if self.us is not None:
@@ -290,7 +331,7 @@ class Orchestrator:
             if meas is not None:
                 self.cube["x_cm"] = meas
             elif self.cube.get("x_cm") is not None:
-                self.cube["x_cm"] += sign * moved
+                self.cube["x_cm"] += d
             self.free_x = None
         elif det is not None or self.plant.position_source() == "ultrasonic":
             self.free_x = meas
@@ -299,7 +340,7 @@ class Orchestrator:
         """Cube(s) for the twin's belt drawing / objects table (same fields as vision's objects)."""
         with self.lock:
             sp = self.plant.speed()
-            v = None if sp is None else {"F": 1, "R": -1}.get(self._dir, 0) * abs(sp)
+            v = None if sp is None else ({"F": 1, "R": -1}.get(self._dir, 0) * abs(sp) if self.moving() else 0.0)
             mk = lambda oid, label, x: dict(id=oid, label=label, x_cm=x, speed_cm_s=v, expected_cm=None, err_cm=None,
                                             diverging=False)
             if self.cube is not None and self.cube.get("x_cm") is not None:
@@ -442,7 +483,7 @@ class Orchestrator:
         state.log(f"Cycle: cube #{c['id']} = {cls} ({why}) -> {dest}")
         if routine and self.plant.live() and self.arm_online is False:
             return self._fault("robotic arm offline")
-        c["travel0"] = self.plant.travel()
+        c["odo0"] = self.odo
         self._belt("R" if reverse else "F", C["run_speed_pct"])
         self._goto("TO_ARM" if routine else "REVERSE" if reverse else "TO_END", dest)
 
@@ -450,7 +491,7 @@ class Orchestrator:
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
         c = self.cube
-        dist = abs(self.plant.travel() - c["travel0"])
+        dist = abs(self.odo - c["odo0"])
         togo = None
         if c.get("src") == "ultrasonic" and c.get("us_target_cm") is not None:
             togo = self.us_to_go(c["us_target_cm"])
@@ -467,11 +508,17 @@ class Orchestrator:
             arrived = dist >= c["target_cm"] - abs(sp or 0.0) * C["stop_latency_s"]
         if arrived:
             self._belt("S")
-            self.cube.update(t_arm_stop_cmd=now)
-            self._push_sent = False
-            self._push_seen_start = False
-            self._homing = self._home_seen = False
-            self._goto("PUSHING", f"{self.cube['routine']} for cube #{self.cube['id']}")
+            self._start_push(now)
+
+    def _start_push(self, now):
+        c = self.cube
+        c["t_arm_stop_cmd"] = now
+        c["push_attempts"] = c.get("push_attempts", 0) + 1
+        self._push_sent = False
+        self._push_seen_start = False
+        self._homing = self._home_seen = False
+        n = c["push_attempts"]
+        self._goto("PUSHING", f"{c['routine']} for cube #{c['id']}" + (f" (attempt {n})" if n > 1 else ""))
 
     def _s_pushing(self, now, det, sp):
         c = self.cube
@@ -481,7 +528,7 @@ class Orchestrator:
                 return                              # wait for the belt to stop under the arm
             if not stopped:
                 return self._fault("belt did not stop at the arm")
-            c["arm_travel_cm"] = round(abs(self.plant.travel() - c["travel0"]), 2)   # where it really stopped
+            c["arm_travel_cm"] = round(abs(self.odo - c["odo0"]), 2)   # where it really stopped
             if self.us is not None:
                 c["arm_us_cm"] = round(self.us, 1)
             if not self.plant.send_arm(c["routine"]):
@@ -513,16 +560,93 @@ class Orchestrator:
             self._sim_done_at = now + C["sim_home_s"]
 
     def _pushed(self, now):
+        """Arm back home: check that the cube really left the belt (unless verification is off)."""
         if self._homing:
             self.cube["t_home_done"] = now
+        V = C["verify"]
+        if V["on"] and (self.plant.live() or V["in_sandbox"]):
+            self._ver = []
+            return self._goto("VERIFY", f"is cube #{self.cube['id']} still on the belt?")
+        self._push_ok("push done")
+
+    def _push_ok(self, msg):
         self._finish("pushed")
         self._belt("F", C["run_speed_pct"])
-        self._goto("RUN", "push done")
+        self._goto("RUN", msg)
+
+    def _cube_at_arm(self):
+        """-> (seen, togo_cm, x_cm): is there a cube at the push point, how far it still is from it (cm of forward
+        belt travel, negative = past it) and its belt position. Ultrasonic cubes use the sensor, others the camera."""
+        c, V = self.cube, C["verify"]
+        if c.get("src") == "ultrasonic" and c.get("us_target_cm") is not None:
+            togo = self.us_to_go(c["us_target_cm"])
+            if togo is None:
+                return False, None, None
+            return abs(togo) <= V["tol_cm"], togo, cfg.us_position_cm(self.us)
+        if not self.last_blobs or self.last_x_stop is None:
+            return False, None, None
+        ppcm, sign = self.plant.geometry()
+        x_t = self.last_x_stop + sign * c["target_cm"] * ppcm
+        cx, _ = min(self.last_blobs, key=lambda b: abs(b[0] - x_t))
+        togo = sign * (x_t - cx) / ppcm
+        return abs(togo) <= V["tol_cm"], togo, self.plant.px_to_cm(cx)
+
+    def _s_verify(self, now, det, sp):
+        V, c = C["verify"], self.cube
+        t = now - self.since
+        if t < V["settle_s"]:
+            return                                  # arm out of the way, cube settled / fallen
+        if det is not None or c.get("src") == "ultrasonic":
+            seen, togo, x = self._cube_at_arm()
+            self._ver.append((seen, togo))
+            if seen and x is not None:
+                c["x_cm"] = x                       # the twin shows where it really is
+        if t < V["settle_s"] + V["window_s"]:
+            return
+        n, hits = len(self._ver), [g for s_, g in self._ver if s_]
+        if n == 0:
+            state.log(f"Cycle: cube #{c['id']}: push could not be verified (no camera / sensor data)", "warn")
+            c["verify"] = "unknown"
+            return self._push_ok("push done (not verified)")
+        if len(hits) / n < V["min_seen_frac"]:
+            c["verify"] = "ok"
+            return self._push_ok("push verified: cube left the belt")
+        togo = float(np.median(hits))
+        c["push_fails"] = c.get("push_fails", 0) + 1
+        c["verify"] = "failed"
+        state.log(f"Cycle: cube #{c['id']} still on the belt after {c['routine']} "
+                  f"(attempt {c['push_attempts']}, {togo:+.1f} cm from the push point)", "warn")
+        if c["push_attempts"] < V["attempts"]:
+            c["correct_cm"] = round(togo, 1)
+            if abs(togo) > V["correct_tol_cm"]:
+                self._corr, self._corr_odo0 = togo, self.odo
+                self._belt("F" if togo > 0 else "R", C["run_speed_pct"])
+                return self._goto("CORRECTING", f"moving cube #{c['id']} {togo:+.1f} cm onto the push point")
+            return self._start_push(now)
+        c["odo0"], c["forced_reverse_s"] = self.odo, C["failed_reverse_s"]
+        self._belt("R", C["run_speed_pct"])
+        self._goto("REVERSE", f"push failed {c['push_attempts']} times: back to the origin "
+                              f"({C['failed_reverse_s']:g} s)")
+
+    def _s_correcting(self, now, det, sp):
+        if self._stalled(now):
+            return self._fault("belt not moving (stall)")
+        if abs(self.odo - self._corr_odo0) >= abs(self._corr) - abs(sp or 0.0) * C["stop_latency_s"]:
+            self._belt("S")
+            self._start_push(now)
 
     def _s_reverse(self, now, det, sp):
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
-        dist = abs(self.plant.travel() - self.cube["travel0"])
+        dist = abs(self.odo - self.cube["odo0"])
+        forced = self.cube.get("forced_reverse_s")
+        if forced is not None:                      # failed push: always this long, no distance check
+            if now - self.since >= forced:
+                self.cube["reverse_cm"] = round(dist, 2)
+                self._finish("push failed, returned to origin")
+                self._belt("F", C["run_speed_pct"])
+                self._goto("RUN", f"failed cube sent back ({dist:.0f} cm, {forced:g} s)")
+            return
         if self._src() == "ultrasonic":             # the sensor sees the cube leave the belt at the origin
             by_cm = self.us is None or cfg.us_position_cm(self.us) is None
         else:
@@ -537,7 +661,7 @@ class Orchestrator:
     def _s_to_end(self, now, det, sp):
         if self._stalled(now):
             return self._fault("belt not moving (stall)")
-        if abs(self.plant.travel() - self.cube["travel0"]) >= C["clear_cm"]:
+        if abs(self.odo - self.cube["odo0"]) >= C["clear_cm"]:
             self._finish("belt end")
             self._goto("RUN", "cube cleared the camera")
 
@@ -603,7 +727,7 @@ class Orchestrator:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         cols = ["time", "id", "cls", "conf", "why", "routine", "outcome", "stop_s", "classify_s", "arm_s", "home_s", "cycle_s",
                 "src", "x_cmd_px", "x_final_px", "us_err_cm", "us_final_cm", "target_cm", "arm_travel_cm", "us_target_cm",
-                "arm_us_cm", "arm_by", "reverse_cm", "deadline_miss", "probs"]
+                "arm_us_cm", "arm_by", "push_attempts", "verify", "correct_cm", "reverse_cm", "deadline_miss", "probs"]
         new = not os.path.exists(path)
         if not new:                                 # columns changed since the file was started: keep it aside
             with open(path) as f:
@@ -620,7 +744,8 @@ class Orchestrator:
                             c.get("routine"), c["outcome"], lat.get("stop_s"), lat.get("classify_s"), lat.get("arm_s"),
                             lat.get("home_s"), lat.get("cycle_s"), c.get("src"), c.get("x_err_px"), c.get("x_final_px"), c.get("us_err_cm"),
                             c.get("us_final_cm"), c.get("target_cm"), c.get("arm_travel_cm"), c.get("us_target_cm"),
-                            c.get("arm_us_cm"), c.get("arm_by"), c.get("reverse_cm"),
+                            c.get("arm_us_cm"), c.get("arm_by"), c.get("push_attempts"), c.get("verify"),
+                            c.get("correct_cm"), c.get("reverse_cm"),
                             ";".join(c.get("deadline_miss", [])), c.get("probs")])
         except OSError as e:
             state.log(f"Cycle log not written: {e}", "warn")

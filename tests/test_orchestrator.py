@@ -27,6 +27,11 @@ class FakePlant:
         self.telemetry = True
         self.hidden = False                              # camera sees no cube (e.g. occluded)
         self.src = "camera"
+        self.push_x = []
+        self.push_fails = 0                              # next pushes that miss the cube
+        self.fail_nudge_px = 0.0                         # a missed push moves the cube by this much
+        self.filtered = False                            # report speed/travel like the Arduino (hold + EMA)
+        self.vf, self.v_hold, self.t_pulse, self.t_tel, self.travel_rep = 0.0, 0.0, -1e9, -1e9, 0.0
         self.us_t, self.us_d = None, None
         self.bg = belt(1, seam=False, glare=False)
 
@@ -36,14 +41,24 @@ class FakePlant:
         if d == "S" and self.ignore_stop and not force:
             return
         self.pending.append((self.t[0] + CMD_DELAY, d))
-    def travel(self): return self.travel_
-    def speed(self): return self.v
+    def travel(self): return self.travel_rep if self.filtered else self.travel_
+    def speed(self): return self.vf if self.filtered else self.v
+    def speed_lag(self): return 0.4 if self.filtered else 0.0
     def telemetry_age(self): return 0.0 if self.telemetry else 99.0
     def geometry(self): return PPCM, 1
     def px_to_cm(self, cx): return cx / PPCM
     def position_source(self): return self.src
     def us_sample(self): return None if self.us_t is None else (self.us_t, self.us_d)
-    def send_arm(self, cmd): self.arm.append(cmd); return True
+    def send_arm(self, cmd):
+        self.arm.append(cmd)
+        if cmd.startswith("PUSH"):
+            self.push_x.append(self.cube_x())           # where the cube was when the arm pushed
+            if self.push_fails > 0:
+                self.push_fails -= 1
+                self.cubes[0] += self.fail_nudge_px
+            else:
+                self.cubes[0] = 1e5                      # pushed off the belt
+        return True
     def publish(self, payload): self.published.append(payload)
 
     def frame(self):
@@ -65,6 +80,13 @@ class FakePlant:
         self.v += (target - self.v) * min(1.0, dt / 0.08)      # fast first-order motor
         self.travel_ += self.v * dt
         self.t[0] += dt
+        if self.t[0] - self.t_tel >= 0.1:                # Arduino: 10 Hz, speed held 400 ms after the last pulse, EMA
+            self.t_tel = self.t[0]
+            if abs(self.v) > 0.3:
+                self.t_pulse, self.v_hold = self.t[0], self.v
+            raw = self.v_hold if self.t[0] - self.t_pulse < 0.4 else 0.0
+            self.vf = 0.2 * raw + 0.8 * self.vf if abs(self.v) > 0.3 or raw else (self.vf * 0.8 if abs(self.vf) > 0.3 else 0.0)
+        self.travel_rep += self.vf * dt
         if self.us_t is None or self.t[0] - self.us_t >= 0.1:     # HC-SR04 telemetry at 10 Hz, nearest cube
             u = cfg.ULTRASONIC
             ds = [-u["facing"] * (u["sensor_x_cm"] - x / PPCM) for x in map(self.cube_x, range(len(self.cubes)))
@@ -125,7 +147,19 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(self.o.state, "PUSHING")               # belt waits for the arm to be home
         for msg in ("OK HOME -> DEGS 90 90 90 0", "DONE", "IDLE"):
             self.o.on_arm_status(msg)
-        self.until_state("RUN", 2.0)
+        self.until_state("VERIFY", 1.0)
+
+    def arm_cycle(self, routine):
+        """One push + HOME, answered like the real arm."""
+        n = len(self.plant.arm)
+        self.assertTrue(self.run_until(lambda: len(self.plant.arm) > n, 5.0), "push never sent")
+        self.assertEqual(self.plant.arm[-1], routine)
+        for msg in (f"{routine} inicio", "DONE", "IDLE"):
+            self.o.on_arm_status(msg)
+        self.assertTrue(self.run_until(lambda: self.plant.arm[-1] == "HOME", 1.0))
+        for msg in ("OK HOME", "DONE", "IDLE"):
+            self.o.on_arm_status(msg)
+        self.until_state("VERIFY", 1.0)
 
     def test_solid_cube_stops_at_centre_is_classified_and_pushed(self):
         self.assertEqual(self.o.start(), "started")
@@ -137,8 +171,9 @@ class TestOrchestrator(unittest.TestCase):
         self.until_state("TO_ARM")
         travel0 = self.plant.travel_
         self.push_routine("PUSH1")
+        self.until_state("RUN", 3.0)
         c = self.o.cubes[0]
-        self.assertEqual((c["cls"], c["routine"], c["outcome"]), ("solid", "PUSH1", "pushed"))
+        self.assertEqual((c["cls"], c["routine"], c["outcome"], c["verify"]), ("solid", "PUSH1", "pushed", "ok"))
         self.assertAlmostEqual(c["arm_travel_cm"], 15.0, delta=1.5)
         self.assertGreater(self.plant.travel_ - travel0, 15.0 - 1.5)
         for k in ("stop_s", "classify_s", "arm_s", "cycle_s"):
@@ -153,6 +188,7 @@ class TestOrchestrator(unittest.TestCase):
                 self.model.set(cls)
                 self.o.start()
                 self.push_routine(routine)
+                self.until_state("RUN", 3.0)
                 c = self.o.cubes[0]
                 self.assertEqual((c["cls"], c["routine"], c["target_cm"]), (cls, routine, cm))
                 self.assertAlmostEqual(c["arm_travel_cm"], cm, delta=1.5)
@@ -260,6 +296,7 @@ class TestOrchestrator(unittest.TestCase):
         self.model.set("stripes", p=0.4)                # 0.4 vs 0.2 / 0.2 / 0.2: formerly "dudoso"
         self.o.start()
         self.push_routine("PUSH2")
+        self.until_state("RUN", 3.0)
         self.assertEqual(self.o.cubes[0]["cls"], "stripes")
         self.assertIn("home_s", self.o.cubes[0]["latency"])
 
@@ -287,8 +324,9 @@ class TestOrchestrator(unittest.TestCase):
         self.run_until(lambda: self.plant.v < 0.1, 2.0)
         self.assertAlmostEqual(self.us_reading(), U["classify_cm"], delta=1.5)
         self.push_routine("PUSH1")
+        self.until_state("RUN", 3.0)
         c = self.o.cubes[0]
-        self.assertEqual((c["src"], c["arm_by"]), ("ultrasonic", "ultrasonic"))
+        self.assertEqual((c["src"], c["arm_by"], c["verify"]), ("ultrasonic", "ultrasonic", "ok"))
         self.assertAlmostEqual(c["arm_us_cm"], c["us_target_cm"], delta=1.5)
         self.assertAlmostEqual(c["arm_travel_cm"], 12.0, delta=1.5)
 
@@ -303,6 +341,50 @@ class TestOrchestrator(unittest.TestCase):
         self.assertEqual(self.o.cubes[0]["outcome"], "returned to origin")
         self.assertLess(self.plant.cube_x() / PPCM, 1.0)          # it left the belt at x = 0
         self.assertGreater(self.plant.cube_x() / PPCM, -3.0)      # and the belt turned forward right after
+
+
+    def test_failed_push_is_corrected_and_retried(self):
+        self.plant.push_fails, self.plant.fail_nudge_px = 1, -30.0     # 1st push misses, knocks it 3 cm back
+        self.o.start()
+        self.until_state("TO_ARM")
+        self.arm_cycle("PUSH1")
+        self.until_state("CORRECTING", 3.0)
+        self.until_state("PUSHING", 3.0)
+        self.arm_cycle("PUSH1")
+        target = 320 + 15.0 * PPCM
+        self.assertLess(abs(self.plant.push_x[-1] - target), 15, "correction did not bring the cube back")
+        self.until_state("RUN", 3.0)
+        c = self.o.cubes[0]
+        self.assertEqual((c["outcome"], c["push_attempts"], c["verify"]), ("pushed", 2, "ok"))
+        self.assertAlmostEqual(c["correct_cm"], 3.0, delta=1.0)
+
+    def test_push_failing_twice_sends_the_cube_back_for_7_s(self):
+        self.plant.push_fails = 2
+        self.o.start()
+        self.until_state("TO_ARM")
+        self.arm_cycle("PUSH1")
+        self.until_state("PUSHING", 3.0)                 # in place already: pushed again without moving
+        self.arm_cycle("PUSH1")
+        self.until_state("REVERSE", 3.0)
+        t0 = self.t[0]
+        self.until_state("RUN", 10.0)
+        self.assertAlmostEqual(self.t[0] - t0, cfg.CYCLE["failed_reverse_s"], delta=0.15)
+        c = self.o.cubes[0]
+        self.assertEqual((c["outcome"], c["push_attempts"]), ("push failed, returned to origin", 2))
+        self.assertEqual(self.plant.arm.count("PUSH1"), 2)
+
+    def test_twin_cube_stops_with_the_belt(self):
+        """Arduino-like filtered speed keeps the integrated travel growing after a stop: the twin must not."""
+        self.plant.filtered = True
+        self.o.start()
+        self.until_state("PUSHING")
+        self.run_until(lambda: False, 2.5)                # belt really stopped; the filtered speed decays meanwhile
+        (ob,) = self.o.objects()
+        x1 = ob["x_cm"]
+        self.assertAlmostEqual(x1, self.plant.push_x[-1] / PPCM, delta=2.0)
+        self.assertEqual(ob["speed_cm_s"], 0.0)
+        self.run_until(lambda: False, 1.0)
+        self.assertEqual(self.o.objects()[0]["x_cm"], x1)
 
 
 if __name__ == "__main__":

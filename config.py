@@ -392,14 +392,31 @@ CYCLE = dict(
     #   us_cm  ultrasonic mode: sensor reading with the cube at the push point  <<< MEASURE (page: "Distance (ultrasonic)")
     push={
         "solid":   dict(routine="PUSH1", cm=2.0, us_cm=19.0),
-        "stripes": dict(routine="PUSH2", cm=7.0, us_cm=15.0),
-        "corners": dict(routine="PUSH3", cm=15.0, us_cm=10.0),
+        "stripes": dict(routine="PUSH2", cm=23.0, us_cm=15.0),
+        "corners": dict(routine="PUSH3", cm=28.0, us_cm=10.0),
     },
     # Classes sent back to the origin: belt reverses until the cube has left the belt, then forward again.
     reverse_classes=("other", "dudoso"),
     reverse_cm=30.0,           # <<< MEASURE: stop line -> origin end of the belt + a few cm (None = time only).
                                # Ultrasonic mode: done when the sensor sees the cube past the belt start instead
     reverse_s=5.0,             # ...or this long in reverse, whichever comes first (None = distance only)
+    # After each push (and HOME): is the cube still at the push point? (camera, or the sensor for ultrasonic cubes)
+    verify=dict(
+        on=True,
+        settle_s=0.5,          # wait after HOME before looking
+        window_s=1.0,          # look for this long ...
+        min_seen_frac=0.5,     # ... cube seen in at least this fraction of the frames / readings -> push failed
+        tol_cm=5.0,            # "at the push point" = within this distance of it
+        attempts=2,            # pushes per cube; between them the belt moves the cube back onto the push point
+        correct_tol_cm=0.5,    # closer than this: push again without moving the belt
+        in_sandbox=False,      # Sandbox: the arm is simulated, the cube never really leaves -> skip the check
+    ),
+    failed_reverse_s=7.0,      # every push failed: belt in reverse for this long (no distance check), then forward
+    coast_s=0.3,               # the belt still moves this long after a stop command (serial + motor stopping);
+                               # after that a stopped belt does not move the twin's cube / the odometer
+    speed_lag_s=0.4,           # lag of the Arduino's filtered speed (EMA 0.2/0.8 at 10 Hz -> 0.1*0.8/0.2 s): the
+                               # travel integrated from it is that far behind, the odometer adds lag * speed.
+                               # TUNE both with logs/cycles.csv: arm_travel_cm should match the real cube position
     clear_cm=12.0,             # any class in neither list: belt travel before looking for the next cube (belt end)
     stopped_cm_s=0.8,          # |belt speed| below this = stopped
     stop_timeout_s=3.0,        # stop commanded, measured speed still above stopped_cm_s after this -> fault.
