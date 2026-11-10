@@ -55,7 +55,27 @@ def payload_text(c, typed):
     return c.get("payload", "{value}").replace("{value}", txt), txt
 
 
+def camera_settings():
+    """Current values of every "camera" control, as {camera_var: int} - sent to a serial camera on (re)connect.
+    Manual exposure / gain are skipped while the matching auto mode is on."""
+    out = {}
+    for c in cfg.CONTROLS:
+        if c.get("target") == "camera":
+            out[c["camera_var"]] = int(state.controls.get(c["id"], typed_default(c)))
+    if out.get("exposure_ctrl"):
+        out.pop("aec_value", None)
+    if out.get("gain_ctrl"):
+        out.pop("agc_gain", None)
+    return out
+
+
 def _camera_set(var, val, label):
+    if cfg.VISION["camera_url"].startswith("serial:"):
+        import camserial
+        ans = camserial.shared(cfg.VISION["camera_url"]).set(var, val)
+        if ans is None or not ans.startswith("ok"):
+            state.log(f"ESP32-CAM (serial) {var}={val}: {ans or 'no answer'}", "warn")
+        return
     url = cfg.VISION["camera_control_url"].rstrip("/") + "/control"
     try:
         r = requests.get(url, params={"var": var, "val": val}, timeout=3)
@@ -75,7 +95,7 @@ def apply(c, typed, bridge, force=False):
     payload, txt = payload_text(c, typed)
     target = c.get("target", "real")
     where = []
-    if target == "camera":                       # HTTP call to the ESP32-CAM, done in a thread so the UI never blocks
+    if target == "camera":                       # serial/HTTP call to the ESP32-CAM, in a thread so the UI never blocks
         val = int(typed)                         # bool -> 0/1, slider float -> int
         threading.Thread(target=_camera_set, args=(c["camera_var"], val, c["label"]), daemon=True).start()
         where.append("camera")

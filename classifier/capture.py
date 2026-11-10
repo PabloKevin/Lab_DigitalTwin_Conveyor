@@ -11,7 +11,8 @@ The raw band is kept so the whole dataset can be re-segmented later if params.js
 (python -m classifier.preprocess ... or a later re-crop script).
 
 Usage (repo root, conda env "Control"):
-    python -m classifier.capture --url http://10.82.234.15 --session bench_white_01 --tune
+    python -m classifier.capture --url serial:/dev/ttyUSB0 --session bench_white_01 --tune   # USB cable (esp32_cam_serial)
+    python -m classifier.capture --url http://10.82.234.15 --session bench_white_01 --tune    # WiFi (esp32cam_stream)
     python -m classifier.capture --source some_belt_video.mp4 --tune       # tune params on a recording
     python -m classifier.capture --source dataset/bench_white_01/class_a    # re-check saved bands
 
@@ -32,6 +33,13 @@ import requests
 
 from classifier import preprocess as pp
 
+try:                                           # camserial.py lives in the repo root (shared with the twin app)
+    import camserial
+except ImportError:                            # run from another directory: add the repo root
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import camserial
+
 TUNE = [  # (trackbar name, params path, max, scale)
     ("canny lo", ("edges", "lo"), 300, 1),
     ("canny hi", ("edges", "hi"), 400, 1),
@@ -48,6 +56,28 @@ CAM_TUNE = ("saturation", "brightness", "contrast")   # camera /control vars, -2
 
 
 # ── frame sources ───────────────────────────────────────────────────────────────────────────
+class SerialCamSource:
+    """ESP32-CAM over USB serial (firmware/esp32_cam_serial): newest streamed frame, settings as commands."""
+
+    def __init__(self, url, crop, cam_settings):
+        port, baud = camserial.parse_url(url)
+        self.cam = camserial.SerialCam(port, baud, settings={"crop": int(crop), **cam_settings})
+        self.crop = bool(crop)
+        self.name = url
+
+    def set(self, var, val):
+        self.cam.set(var, val)
+
+    def read(self):
+        f = self.cam.wait_frame(timeout=3.0)
+        if f is None:
+            raise IOError(f"no frame from {self.name} ({self.cam.status})")
+        img = f.decode()
+        if img is None:
+            raise IOError("corrupted JPEG")
+        return camserial.middle_third(img) if self.crop else img   # hardware-JPEG firmware: crop on the PC
+
+
 class Esp32Cam:
     def __init__(self, base, crop, cam_settings):
         self.base = base.rstrip("/")
@@ -130,7 +160,7 @@ class Writer:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--url", help="ESP32-CAM base URL, e.g. http://10.82.234.15 (uses /capture and /control)")
+    ap.add_argument("--url", help="ESP32-CAM: serial:/dev/ttyUSB0[@baud] (USB cable) or http://<ip> (WiFi)")
     ap.add_argument("--source", help="instead of the camera: image folder / glob, video file, or webcam index")
     ap.add_argument("--crop", type=int, default=1, help="ask the camera for the cut middle band (1) or full frame (0)")
     ap.add_argument("--session", default=time.strftime("session_%Y%m%d_%H%M"),
@@ -144,7 +174,8 @@ def main():
     p = pp.load_params(a.params)
     classes = p["model"]["classes"]
     if a.url:
-        src = Esp32Cam(a.url, a.crop, p.get("camera", {}))
+        cls_ = SerialCamSource if a.url.startswith("serial:") else Esp32Cam
+        src = cls_(a.url, a.crop, p.get("camera", {}))
     elif a.source and (os.path.isdir(a.source) or any(ch in a.source for ch in "*?")
                        or a.source.lower().endswith((".png", ".jpg", ".jpeg", ".bmp"))):
         src = Files(a.source)
@@ -159,7 +190,7 @@ def main():
     if a.tune:
         for name, (sec, key), mx, sc in TUNE:
             cv2.createTrackbar(name, win, int(round(p[sec][key] * sc)), mx, lambda _v: None)
-        if isinstance(src, Esp32Cam):
+        if isinstance(src, (Esp32Cam, SerialCamSource)):
             for var in CAM_TUNE:
                 cv2.createTrackbar(f"cam {var}", win, int(p.get("camera", {}).get(var, 0)) + 2, 4, lambda _v: None)
 
@@ -167,7 +198,7 @@ def main():
     while True:
         try:
             band = src.read()
-        except requests.RequestException as e:
+        except (requests.RequestException, IOError) as e:
             print(f"camera error: {e}")
             time.sleep(1.0)
             continue
@@ -179,7 +210,7 @@ def main():
             for name, (sec, key), _mx, sc in TUNE:
                 v = cv2.getTrackbarPos(name, win)
                 p[sec][key] = v / sc if sc != 1 else v
-            if isinstance(src, Esp32Cam):
+            if isinstance(src, (Esp32Cam, SerialCamSource)):
                 cam = p.setdefault("camera", {})
                 for var in CAM_TUNE:
                     v = cv2.getTrackbarPos(f"cam {var}", win) - 2

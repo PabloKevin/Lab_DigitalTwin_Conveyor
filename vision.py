@@ -284,6 +284,7 @@ class ClockSync:
 
 class CameraReader(threading.Thread):
     """Keeps only the newest frame so slow inference never adds latency.
+    "serial:<port>" = ESP32-CAM over USB serial (camserial.py, frames carry the capture timestamp);
     http(s) URLs use the hand-written MJPEG parser (uses X-Timestamp); anything else (file, 0 = webcam) uses OpenCV."""
 
     def __init__(self, url):
@@ -296,9 +297,13 @@ class CameraReader(threading.Thread):
 
     def run(self):
         http = isinstance(self.url, str) and self.url.startswith("http")
+        ser = isinstance(self.url, str) and self.url.startswith("serial:")
         while True:
             try:
-                self._run_http() if http else self._run_cv()
+                if ser:
+                    self._run_serial()
+                else:
+                    self._run_http() if http else self._run_cv()
             except Exception as e:
                 state.vision_status = f"camera error: {type(e).__name__}"
             time.sleep(1.5)
@@ -313,6 +318,24 @@ class CameraReader(threading.Thread):
                 if frame is None:                       # ESP32-CAM sometimes sends a damaged JPEG
                     continue
                 self._push(frame, sync.to_pc(ts, arrival) if ts is not None else arrival)
+
+    def _run_serial(self):
+        import camserial
+        import controls
+        cam = camserial.shared(self.url, settings=controls.camera_settings(),
+                               on_log=lambda m: state.log(f"ESP32-CAM: {m}"))
+        sync = ClockSync()
+        while True:
+            f = cam.wait_frame(timeout=2.0)
+            if f is None:
+                state.vision_status = f"camera (serial): {cam.status}"
+                continue
+            frame = f.decode()
+            if frame is None:                       # corrupted JPEG that still passed the checksum: skip
+                continue
+            if state.controls.get("cam_crop", True):  # hardware-JPEG firmware sends full frames: crop the band here
+                frame = camserial.middle_third(frame)
+            self._push(frame, sync.to_pc(f.ts_cam, f.arrival))
 
     def _run_cv(self):
         cap = cv2.VideoCapture(self.url)

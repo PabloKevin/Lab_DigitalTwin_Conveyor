@@ -6,7 +6,7 @@ on a small headless board (no GPU needed) - no PyTorch/YOLO anywhere in the stac
 
 ```
  Arduino UNO (PID, encoder, XY-15AS) ──USB serial──►  app.py  ◄── browser (localhost:8050)
- ESP32-CAM ────────── HTTP MJPEG stream ─────────────►  vision.py (bg subtraction + tracking) ──MQTT──► Mosquitto (optional, outbound only)
+ ESP32-CAM ──USB serial (camserial.py) or WiFi MJPEG──►  vision.py (bg subtraction + tracking) ──MQTT──► Mosquitto (optional, outbound only)
 ```
 
 The conveyor (motor + encoder + PID) is driven by an Arduino UNO over a direct USB-serial link
@@ -57,7 +57,18 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
    hand from the Arduino IDE Serial Monitor (115200 baud, "Newline"): `V50`, `F`, `R`, `S`, like the old sketch.
    Opening the port resets the UNO; `app.py` then pushes the page's speed and PID gains to it, but leaves
    the belt stopped until you press a direction again.
-2. **Camera** (ESP32-CAM, see `firmware/esp32_cam/README.md`): the twin works with the stream on `:81/stream` and the
+2. **Camera over USB serial (default, recommended in the lab - the WiFi there is too slow)**: flash
+   `firmware/esp32_cam_serial/esp32_cam_serial.ino` (board "AI Thinker ESP32-CAM", PSRAM on) through the ESP32-CAM-MB
+   board and leave it plugged into the PC. In `config.py` set `VISION["camera_url"] = "serial:/dev/ttyUSB0"` (the
+   ESP32-CAM's port, not the Arduino's; `"serial:/dev/ttyUSB0@921600"` if you see many bad packets) and
+   `VISION["mode"] = "bgsub"`. At startup the log shows `ESP32-CAM: ready ...`. Frames are JPEG packets with a capture
+   timestamp and a checksum (protocol in `camserial.py`); the camera settings on the page are sent as serial commands
+   and re-sent automatically if the camera reboots. The Arduino IDE Serial Monitor shows only binary now - close it
+   (one program per port). No camera at hand: `python sim_camserial.py` and use the `/dev/pts/N` it prints.
+   The firmware sends hardware-JPEG full frames by default (fast, sensor colours) and the PC crops the belt band when
+   *Crop to belt band* is on. Slow or odd colours? Stop app.py and run `python camserial.py /dev/ttyUSB0`: it prints
+   fps, KB/s, frame size, bad packets and the firmware's own timing (capture / encode / send).
+   **Camera over WiFi** (old way, `firmware/esp32_cam/`): the twin works with the stream on `:81/stream` and the
    `/control` endpoint of your firmware. In `config.py` set `VISION["camera_url"]` and `VISION["camera_control_url"]`
    (IP or `esp32cam.local`) and `VISION["mode"] = "bgsub"`. If `.local` does not resolve on Ubuntu:
    `sudo apt install avahi-daemon libnss-mdns`, or just use the IP printed on the camera's serial monitor.
@@ -150,6 +161,8 @@ New kinds go in `divergence._check()`.
 | `app.py` | the web page (layout is generated from `config.py`), `assets/style.css` = look |
 | `serial_bridge.py` | conveyor in/out over USB serial (Arduino UNO) |
 | `mqtt_bridge.py` | MQTT in/out (camera/vision object broadcasts only) |
+| `camserial.py` | ESP32-CAM over USB serial: packet parser, settings commands, auto-reset (shared by vision.py and classifier/capture.py) |
+| `sim_camserial.py` | fake ESP32-CAM on a virtual serial port (`tests/test_camserial.py` uses it) |
 | `twin_model.py` | simulated conveyor, derived variables, belt travel, runs the rules |
 | `divergence.py` | rule engine |
 | `vision.py` | MJPEG reader, background-subtraction + centroid tracking, pixel→cm, speed, annotated video, simulated vision |
@@ -158,7 +171,8 @@ New kinds go in `divergence._check()`.
 | `sim_conveyor.py` | fake Arduino for testing (virtual serial port) |
 | `firmware/arduino_uno_conveyor/` | Arduino UNO controller sketch (PID + serial) - the one currently used |
 | `firmware/esp32_conveyor/` | ESP32 controller sketch (PID + WiFi/MQTT) - kept for reference, not currently used (H-bridge driving issue) |
-| `firmware/esp32_cam/` | notes for the ESP32-CAM sketch and `secrets.h` template |
+| `firmware/esp32_cam_serial/` | ESP32-CAM sketch: JPEG frames over USB serial, no WiFi - the one currently used |
+| `firmware/esp32_cam/` | ESP32-CAM WiFi sketch (MJPEG over HTTP) and `secrets.h` template |
 
 ## 7. Known limitations
 

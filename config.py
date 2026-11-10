@@ -103,13 +103,20 @@ STALE_AFTER_S = 2.0        # a value older than this is shown as "—" / conside
 # ════════════════════════════════════════════════════════════════════════════
 VISION = dict(
     mode="bgsub",           # "bgsub" = real camera + background subtraction | "sim" = fake objects (no camera) | "off"
+    # Camera link. USB serial (firmware/esp32_cam_serial/, PC side camserial.py) - the lab WiFi was too slow:
+    #   "serial:/dev/ttyUSB0"          (default 2 Mbaud)   or "serial:/dev/ttyUSB0@921600" if the link is noisy.
+    # Both the Arduino and the ESP32-CAM-MB are CH340 -> /dev/ttyUSB0/1 can swap between reboots; the stable names are
+    # in /dev/serial/by-id/ (ls -l /dev/serial/by-id) - but two CH340s look alike there too, so the safest check is
+    # the "[info] ESP32-CAM: ready ..." line at startup. Without a camera: python sim_camserial.py -> serial:/dev/pts/N
+    camera_url="serial:/dev/ttyUSB0",
+    # --- WiFi alternative (firmware/esp32_cam/esp32cam_stream.ino): set camera_url to the HTTP stream instead ---
     # ESP32-CAM firmware: stream on port 81, settings endpoint /control on port 80 (also accepts a video file or 0 = webcam).
     # Using the ESP32-CAM's real IP instead of esp32cam.local (mDNS) - avoids depending on avahi-daemon/
     # libnss-mdns being installed, which isn't a given on minimal OrangePi images. Found via nmap -p 80,81
     # <subnet>: the host with both 80 and 81 open is the camera. Re-check this if the camera gets a new
     # DHCP lease (e.g. after a router reboot) - a static DHCP reservation on the router avoids that.
-    camera_url="http://10.82.234.15:81/stream",
-    camera_control_url="http://10.82.234.15",
+    # camera_url="http://10.82.234.15:81/stream",
+    camera_control_url="http://10.82.234.15",     # only used with an http:// camera_url
     # Background subtraction (OpenCV MOG2) - no GPU/ML runtime, cheap enough for a Pi-class board.
     # The belt must be empty and mostly static for a few seconds after startup so it can learn the background.
     process_fps=8,           # max detections per second - the video itself is still shown at full camera
@@ -249,7 +256,7 @@ PLOTS = [
 # ════════════════════════════════════════════════════════════════════════════
 # CONTROLS
 #   kind:    "slider" | "number" | "buttons" | "switch"
-#   target:  "camera" -> HTTP call to the ESP32-CAM /control endpoint (needs camera_var)
+#   target:  "camera" -> ESP32-CAM setting (needs camera_var): "set <var> <val>" over serial, or HTTP /control
 #            "real"  -> sent to the conveyor (over serial, via serial_bridge.py) only
 #            "twin"  -> change the digital model / vision parameter only (what-if, calibration, fault injection)
 #            "both"  -> sent to the conveyor and changes the twin
@@ -309,8 +316,9 @@ CONTROLS = [
     dict(id="filt_debug", group="Detection filters", label="Show blob measurements on video", kind="switch",
          default=DETECTION_FILTERS["debug"]["on"], target="twin", model_var="filt_debug"),
 
-    # ESP32-CAM settings: sent as  http://<camera>/control?var=<camera_var>&val=<int>  (see the camera firmware).
-    # They apply on the camera immediately. The defaults below mirror what the firmware sets at boot.
+    # ESP32-CAM settings: "set <camera_var> <int>" over serial (or http://<camera>/control?var=..&val=.. on WiFi).
+    # They apply on the camera immediately; over serial the current values are also re-sent every time the camera
+    # (re)connects or reboots.
     # Moving belt tip: switch "Auto exposure" off and use a short manual exposure to reduce motion blur (add light!).
     dict(id="cam_crop", group="Camera settings", label="Crop to belt band (low latency)", kind="switch", default=True,
          target="camera", camera_var="crop"),
@@ -320,11 +328,11 @@ CONTROLS = [
     dict(id="cam_quality", group="Camera settings", label="JPEG quality (10 best … 63 smallest)", kind="slider",
          min=10, max=63, step=1, default=16, target="camera", camera_var="quality"),
     dict(id="cam_brightness", group="Camera settings", label="Brightness", kind="slider",
-         min=-2, max=2, step=1, default=1, target="camera", camera_var="brightness"),
+         min=-2, max=2, step=1, default=0, target="camera", camera_var="brightness"),
     dict(id="cam_contrast", group="Camera settings", label="Contrast", kind="slider",
          min=-2, max=2, step=1, default=0, target="camera", camera_var="contrast"),
     dict(id="cam_saturation", group="Camera settings", label="Saturation", kind="slider",
-         min=-2, max=2, step=1, default=-2, target="camera", camera_var="saturation"),
+         min=-2, max=2, step=1, default=1, target="camera", camera_var="saturation"),   # -2 washed yellow into white
     dict(id="cam_autoexp", group="Camera settings", label="Auto exposure", kind="switch", default=True,
          target="camera", camera_var="exposure_ctrl"),
     dict(id="cam_exposure", group="Camera settings", label="Manual exposure (0 … 1200)", kind="slider",

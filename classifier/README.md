@@ -18,7 +18,9 @@ Use the conda env **`Control`** (TensorFlow 2.20, OpenCV with GUI), run from the
 | `capture.py` | live dataset capture from the ESP32-CAM, tuning trackbars (incl. camera saturation/brightness/contrast) |
 | `recrop.py` | re-run the pipeline on all saved frames after a params change; `--rename old=new` for classes |
 | `augment.py` | frame-level scale ×0.7–1.3 + any rotation (camera height / pose) → re-detect; face-level rot90/flip, colour permutation, light, blur, noise, JPEG |
-| `tests/` | `python -m unittest classifier.tests.test_preprocess -v` |
+| `train.py` | small CNN (61 k params), blocked K-fold CV + final model → `classifier/runs/<name>/` (report, confusion, errors) |
+| `live.py` | live test on the PC: camera → detection → CNN → 5-frame vote → class / dudoso + destination; keys 1..4 save the frame with its true class |
+| `tests/` | `python -m unittest discover -s classifier/tests -t .` |
 
 ## How the cube is found
 Edges → solid mask → each blob's rotated rectangle must be a **square**: sides ratio ≤ `max_side_ratio`,
@@ -35,8 +37,17 @@ upright 64×64 image of the face only - no background, no rotation, no size (cla
    (saturation +2 by default) at start and has live trackbars. Yellow must look clearly different from white.
 3. `crop.px_per_cm`: measure it at your camera height (cube side in px / side in cm) - it only affects the
    `side_cm` size filter and the reported size.
-4. `python -m classifier.capture --url http://<cam-ip> --session <name> --tune`
+4. `python -m classifier.capture --url serial:/dev/ttyUSB0 --session <name> --tune`
+   (USB cable, firmware `firmware/esp32_cam_serial/`; `--url http://<cam-ip>` for the WiFi firmware;
+   `--crop 0` sends the full 640×480 frame - better for photos on a desk, slower: ~5 fps instead of ~15)
    - 1..4 pick the class, **a** auto-save while slowly rotating/moving the cube, **b** empty-background shots,
      **p** save tuned params.
 5. One session per setup (background, light, camera height); the train/test split is by session.
 6. Target 150–300 shots per class, both cube sizes, every colour combination you can make.
+
+## Training
+`python -m classifier.train --sessions 10` (add more sessions as you collect them). Augmentation: rotations
+0/90/180/270, light (brightness, contrast, gamma, white balance, mild saturation/hue) and, by default, a random
+colour permutation (`--colour-perm 0.8`; the classes depend on which stickers share a colour, not on the colour).
+Validation is blocked cross-validation (contiguous blocks of shots per class) because consecutive shots are
+near-duplicates. Session 10 (95 faces): CV accuracy 0.79 with rotation + light only, 0.82 with colour permutation.
