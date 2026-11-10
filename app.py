@@ -4,9 +4,12 @@ app.py - local web page for the conveyor digital twin.   Run:  python app.py
 The page is generated from config.py (panels, plots, controls, divergence rules), so most changes
 need no edit here. Edit this file only to change how things LOOK.
 """
+import base64
 import threading
 import time
 import webbrowser
+
+import cv2
 
 import plotly.graph_objects as go
 from dash import ALL, Dash, Input, Output, ctx, dcc, html, no_update
@@ -14,6 +17,7 @@ from flask import Response
 
 import config as cfg
 import controls
+import orchestrator
 import twin_model
 import vision
 from mqtt_bridge import MqttBridge
@@ -23,7 +27,8 @@ from state import is_num, state
 L = cfg.BELT_LENGTH_CM
 VAR = {v["id"]: v for v in cfg.VARIABLES}
 bridge = SerialBridge()        # conveyor (motor + encoder): Arduino UNO over USB serial
-mqtt = MqttBridge()            # camera/vision only: vision.py publishes detections here
+mqtt = MqttBridge()            # vision broadcasts + robotic arm (orchestrator.py) + cycle events
+orch = None                    # orchestrator.Orchestrator, created in main()
 
 app = Dash(__name__, title="Conveyor digital twin", update_title=None)
 server = app.server
@@ -189,6 +194,74 @@ def badges_view():
 # ════════════════════════════════════════════════════════════════════════════
 # Figures
 # ════════════════════════════════════════════════════════════════════════════
+STATE_LVL = {"IDLE": "na", "SAFE_STOP": "alarm"}
+
+
+def face_uri(face_rgb):
+    ok, png = cv2.imencode(".png", cv2.resize(cv2.cvtColor(face_rgb, cv2.COLOR_RGB2BGR), (96, 96),
+                                              interpolation=cv2.INTER_NEAREST))
+    return "data:image/png;base64," + base64.b64encode(png.tobytes()).decode() if ok else None
+
+
+def cycle_view():
+    if orch is None:
+        return html.P("orchestrator not running", className="empty")
+    v = orch.view()
+    st = v["state"]
+    head = html.Div(className="cyc-head", children=[
+        html.Span(st, className=f"chip {STATE_LVL.get(st, '')}"),
+        html.Span(f" {time.time() - v['since']:.0f} s  ·  {v['msg']}", className="cyc-msg")])
+    arm = ("online" if v["arm_online"] else "OFFLINE" if v["arm_online"] is False else "no status yet")
+    if not v["live"]:
+        arm = "simulated (Sandbox)"
+    info = [html.Div(className="kv", children=[html.Span("Robotic arm", className="k"),
+                                                html.Span(f"{arm}  ·  last: {v['arm_last'] or '—'}", className="v")])]
+    cur = v["cube"] or (v["cubes"][0] if v["cubes"] else None)
+    body = []
+    if cur:
+        probs = v["probs"] or cur.get("probs")
+        rows = [html.Div(f"cube #{cur['id']}  →  {cur.get('cls', '…')}  {('→ ' + cur['routine']) if cur.get('routine') else ''}",
+                         className="cyc-cls")]
+        if cur.get("why"):
+            rows.append(html.Div(cur["why"], className="cyc-why"))
+        if v["vote"]:
+            rows.append(html.Div("votes: " + " ".join(v["vote"]["votes"]), className="cyc-why"))
+        if probs:
+            rows.append(html.Div(className="cyc-probs", children=[
+                html.Div(className="pr", children=[html.Span(c, className="pc"),
+                                                   html.Span(className="pb", style={"width": f"{100 * p:.0f}%"}),
+                                                   html.Span(f"{p:.2f}", className="pv")])
+                for c, p in zip(v["classes"], probs)]))
+        uri = face_uri(v["face"]) if v["face"] is not None else None
+        body.append(html.Div(className="cyc-cube", children=[html.Img(src=uri, className="cyc-face") if uri else None,
+                                                             html.Div(rows)]))
+    cnt = v["counts"]
+    tally = "  ·  ".join(f"{k} {cnt.get(k, 0)}" for k in v["classes"] + ["dudoso", "missed", "faults"] if cnt.get(k))
+    body.append(html.Div(f"Totals: {tally or 'none yet'}", className="cyc-why"))
+    if v["misses"]:
+        body.append(html.Div("Deadline misses: " + ", ".join(f"{k} {n}" for k, n in v["misses"].items()),
+                             className="cyc-why warn"))
+    hist = [html.Tr([html.Td(c["id"]), html.Td(c.get("cls", "—")), html.Td(c["outcome"]),
+                     html.Td(f"{c['latency'].get('classify_s', float('nan')):.2f}"),
+                     html.Td(f"{c['latency'].get('arm_s', float('nan')):.1f}"),
+                     html.Td(f"{c['latency'].get('cycle_s', float('nan')):.1f}")],
+                    className="bad" if c.get("deadline_miss") or c["outcome"].startswith("fault") else "")
+            for c in v["cubes"][:6]]
+    if hist:
+        body.append(html.Table(className="tbl", children=[
+            html.Thead(html.Tr([html.Th(h) for h in ("#", "class", "outcome", "classify s", "arm s", "cycle s")])),
+            html.Tbody(hist)]))
+    return html.Div([head, *info, *body])
+
+
+def cycle_marks():
+    """Belt positions (cm) of the camera stop line and of the arm, for the belt drawing."""
+    fr = state.cam_frame
+    w = fr[0].shape[1] if fr is not None else 640
+    stop_cm = vision.px_to_cm(w * cfg.CYCLE["stop_x_frac"])
+    return stop_cm, stop_cm + cfg.CYCLE["arm_distance_cm"]
+
+
 def belt_figure():
     sandbox = not state.sync
     speed = state.get("model_belt_speed_cm_s") if sandbox else state.get("belt_speed_cm_s")
@@ -219,6 +292,13 @@ def belt_figure():
                              hoverinfo="skip", textfont=dict(color=INK, size=11),
                              marker=dict(symbol="triangle-left" if cfg.ULTRASONIC["facing"] < 0 else "triangle-right",
                                          size=18, color=GREEN, line=dict(color=INK, width=1))))
+
+    # sorting cycle: camera stop line and robotic arm position
+    stop_cm, arm_cm = cycle_marks()
+    for x, label, col in ((stop_cm, "cam", AMBER), (arm_cm, "arm", PURPLE)):
+        if 0 <= x <= L + 8:
+            fig.add_shape(type="line", x0=x, x1=x, y0=0.6, y1=5.4, line=dict(color=col, width=2, dash="dash"))
+            fig.add_annotation(x=x, y=0.35, text=label, showarrow=False, font=dict(color=col, size=11))
 
     objs = belt_objects()
     # (the encoder-predicted position is not drawn; it is still computed for the "Object position" divergence rule)
@@ -319,7 +399,8 @@ def serve_layout():
     return html.Div(className="app", children=[
         html.Header(className="top", children=[
             html.Div(children=[html.H1("Conveyor digital twin"),
-                               html.P(f"{L:g} cm belt · Arduino over serial · camera + bg subtraction", className="sub")]),
+                               html.P(f"{L:g} cm belt · Arduino over serial · camera + cube classifier · robotic arm over MQTT",
+                                      className="sub")]),
             html.Div(id="badges", className="badges"),
             html.Div(className="actions", children=[
                 dcc.RadioItems(id="sync", value="live" if state.sync else "sandbox", className="seg", inline=True,
@@ -335,6 +416,12 @@ def serve_layout():
             html.Div(className="col", children=controls_block()),
             html.Div(className="col", children=[html.Div(id="panels", className="stack"), html.Div(id="diverge")]),
             html.Div(className="col", children=[
+                card("Sorting cycle",
+                     html.Div(className="cyc-btns", children=[
+                         html.Button("Start", id="cyc-start", className="btn go"),
+                         html.Button("Stop", id="cyc-stop", className="btn"),
+                         html.Button("Reset fault", id="cyc-reset", className="btn")]),
+                     html.Div(id="cycle")),
                 card("Camera", html.Img(src="/video_feed", className="cam")),
                 html.Div(id="objects"),
             ]),
@@ -349,6 +436,7 @@ def serve_layout():
         dcc.Interval(id="slow", interval=500),
         html.Div(id="ctl-sink", hidden=True),
         html.Div(id="sync-sink", hidden=True),
+        html.Div(id="cyc-sink", hidden=True),
     ])
 
 
@@ -377,7 +465,20 @@ def on_estop(_):
     c = controls.BY_ID[cfg.ESTOP["control"]]
     state.log("E-STOP pressed", "alert")
     controls.apply(c, cfg.ESTOP["value"], bridge, force=True)
+    if orch is not None:
+        orch.estop()
     return controls.to_component(c, cfg.ESTOP["value"])
+
+
+@app.callback(Output("cyc-sink", "children"), Input("cyc-start", "n_clicks"), Input("cyc-stop", "n_clicks"),
+              Input("cyc-reset", "n_clicks"), prevent_initial_call=True)
+def on_cycle(*_):
+    if orch is None:
+        return no_update
+    act = {"cyc-start": orch.start, "cyc-stop": orch.stop, "cyc-reset": orch.reset}.get(ctx.triggered_id)
+    if act:
+        state.log(f"Cycle {ctx.triggered_id[4:]}: {act()}")
+    return ""
 
 
 @app.callback(Output("sync-sink", "children"), Input("sync", "value"))
@@ -393,10 +494,10 @@ def on_sync(v):
 @app.callback(
     Output("badges", "children"), Output("belt", "figure"), Output("panels", "children"), Output("diverge", "children"),
     Output("objects", "children"), Output("events", "children"), Output("monitor", "children"), Output("last-cmd", "children"),
-    Input("fast", "n_intervals"))
+    Output("cycle", "children"), Input("fast", "n_intervals"))
 def refresh(_):
     return (badges_view(), belt_figure(), panels_view(), divergence_view(), objects_view(), events_view(),
-            monitor_view(), "Last command: " + state.last_command)
+            monitor_view(), "Last command: " + state.last_command, cycle_view())
 
 
 @app.callback(Output({"type": "plot", "id": ALL}, "figure"), Input("slow", "n_intervals"))
@@ -410,6 +511,8 @@ def main():
     mqtt.start()
     twin_model.start()
     vision.start(mqtt)
+    global orch
+    orch = orchestrator.start(bridge, mqtt)
     url = f"http://{cfg.WEB['host']}:{cfg.WEB['port']}"
     print(f"\n  Digital twin running at {url}\n")
     if cfg.WEB.get("open_browser"):

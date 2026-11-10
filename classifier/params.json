@@ -47,8 +47,8 @@
     ]
   },
   "decision": {
-    "n_frames": 5,
-    "min_agree": 4,
+    "n_frames": 3,
+    "min_agree": 2,
     "tau": 0.7
   },
   "destinations": {

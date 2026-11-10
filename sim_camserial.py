@@ -20,13 +20,14 @@ import camserial
 
 
 class FakeCam:
-    def __init__(self, fps=12.0, junk=0.0, size=(640, 160)):
+    def __init__(self, fps=12.0, junk=0.0, size=(640, 160), results=False):
         self.master, slave = os.openpty()
         tty.setraw(self.master)
         tty.setraw(slave)
         self.port = os.ttyname(slave)
         self._slave = slave                          # keep it open so the pty stays alive
-        self.fps, self.junk, self.size = fps, junk, size
+        self.fps, self.junk, self.size, self.results = fps, junk, size, results
+        self.n = 0
         self.streaming, self.settings, self.seq = False, {}, 0
         self.t0 = time.monotonic()
         self.commands = []
@@ -68,8 +69,30 @@ class FakeCam:
         q = 90 - 2 * self.settings.get("quality", 12)
         return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, max(10, q)])[1].tobytes()
 
+    def _result(self):
+        """Fake classifier output (like firmware/esp32_cam_classifier): a 'R' JSON + a 'F' face per frame."""
+        import json
+        self.n += 1
+        k = (self.n // 3) % 4
+        probs = [0.04] * 4
+        probs[k] = 0.88
+        names = ["solid", "stripes", "corners", "other"]
+        dec = names[k] if self.n % 3 == 0 else None
+        res = dict(n=self.n, t=self._ts() / 1e6, st="ok", box=[280, 210, 340, 270],
+                   c=[280, 210, 340, 210, 340, 270, 280, 270], cm=5.7, p=probs, cls=names[k],
+                   votes=[names[k]] * (self.n % 3 or 3), dec=dec if dec != "other" else "dudoso",
+                   ms=dict(cap=3, jpg=90, pre=40, cnn=180))
+        if res["dec"]:
+            res.update(why="3/3 votes, conf 0.88", dest="servo_1", new=True)
+        self._send(b"R", json.dumps(res).encode())
+        face = np.zeros((64, 64, 3), np.uint8)
+        face[:] = (40 + 50 * k, 120, 200)
+        self._send(b"F", face.tobytes())
+
     def _tx(self):
         while not self._stop:
+            if self.results:
+                self._result()
             if self.streaming:
                 ts = self._ts()
                 self._send(b"J", self.frame(ts / 1e6), ts=ts, corrupt=bool(self.junk) and random.random() < self.junk)
@@ -111,8 +134,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--fps", type=float, default=12)
     ap.add_argument("--junk", type=float, default=0.0, help="probability of garbage / corrupted packet per frame")
+    ap.add_argument("--results", action="store_true", help="also send fake classifier results (device_live test)")
     a = ap.parse_args()
-    cam = FakeCam(a.fps, a.junk).start()
+    cam = FakeCam(a.fps, a.junk, results=a.results).start()
     print(f"Fake ESP32-CAM on {cam.port}   ->   camera_url = \"serial:{cam.port}\"   (Ctrl-C to stop)")
     try:
         while True:

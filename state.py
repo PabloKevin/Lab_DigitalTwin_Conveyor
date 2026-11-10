@@ -47,6 +47,8 @@ class TwinState:
         self.travel_hist = deque(maxlen=1200)  # (time, travel_real) so camera frames can be compared at THEIR capture time
         self.objects = []                      # list of dicts published by vision.py
         self.jpeg = None                       # last annotated camera frame (bytes)
+        self.cam_frame = None                  # (raw BGR frame, capture time, seq) - newest, for orchestrator.py
+        self.cycle_overlay = None              # fn(img) drawing the orchestrator's marks on the video
 
         # diagnostics
         self.divergences = {}

@@ -88,6 +88,28 @@ installer from mosquitto.org; Ubuntu → `sudo apt install mosquitto mosquitto-c
    (sensitivity) in `config.py`'s `VISION` dict while watching the overlay. There's no object classification (no
    `"label"` beyond a generic `"object"`) since there's no neural network in this pipeline - only position/speed.
 
+## 2b. Automatic sorting cycle (lab 03) - `orchestrator.py`
+
+```
+IDLE --Start--> RUN --cube seen before the stop line--> OBJECT_DETECTED --centre reaches the line--> stop
+  --> CLASSIFYING (belt stopped, vote of 3 frames, NumPy CNN classifier/models/cube_classifier.npz)
+        solid / stripes --> TO_ARM (belt runs CYCLE["arm_distance_cm"] by encoder) --> stop --> PUSHING:
+                            MQTT eezybot/cmd "PUSH1" / "PUSH2", wait for "IDLE" on eezybot/status --> RUN
+        corners / other / dudoso --> TO_END (belt runs clear_cm) --> RUN   (cube rides to the end basket)
+  any fault (telemetry / camera lost, belt not stopping or stalled, arm ERR / timeout / offline) or E-stop
+        --> SAFE_STOP (belt stopped, arm STOP) until "Reset fault"
+```
+* Page: card **Sorting cycle** (Start / Stop / Reset fault, state, the classified face, probabilities, votes, totals,
+  deadline misses, last cubes). The belt drawing shows the camera stop line (`cam`) and the arm (`arm`); the video
+  shows the stop line and the face being classified.
+* Needs `VISION["mode"] = "bgsub"` (camera frames) and the arm on the same MQTT broker (its firmware's `MQTT_HOST` =
+  this PC's IP). In **Sandbox** the belt commands only move the twin and the arm is simulated.
+* Before the first run **measure `CYCLE["arm_distance_cm"]`** (stop line → arm push point). Then tune
+  `stop_latency_s` from `logs/cycles.csv`: `x_final_px` (camera) and `arm_travel_cm - arm_distance_cm` (arm) ~ 0.
+* Every cube: one line in `logs/cycles.csv` (class, confidence, routine, outcome, stop / classify / arm / cycle
+  latencies, deadline misses) and JSON events on `conveyor/cycle` - material for the report's deadlines section.
+* Tests: `python -m unittest tests.test_orchestrator -v` (simulated plant, 12 scenarios incl. faults).
+
 ## 3. Serial protocol (conveyor) and MQTT (camera only)
 
 | Line | Direction | Payload |

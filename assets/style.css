@@ -115,3 +115,20 @@ body {
 .ev .t { color: var(--muted); flex: none; }
 .ev.alert { color: var(--alarm); font-weight: 600; }
 .ev.warn { color: var(--warn); }
+
+/* sorting cycle (orchestrator.py) */
+.cyc-btns { display: flex; gap: 8px; margin-bottom: 10px; }
+.btn { border: 1px solid var(--line); background: #fff; border-radius: 6px; padding: 6px 14px; font: inherit; cursor: pointer; }
+.btn.go { background: var(--ok); border-color: var(--ok); color: #fff; font-weight: 650; }
+.btn:focus-visible { outline: 3px solid #b9d3f5; outline-offset: 2px; }
+.cyc-head { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; flex-wrap: wrap; }
+.cyc-msg { color: var(--muted); font-size: 13px; }
+.cyc-cube { display: flex; gap: 12px; align-items: flex-start; margin: 8px 0; }
+.cyc-face { width: 96px; height: 96px; border-radius: 4px; border: 1px solid var(--line); image-rendering: pixelated; }
+.cyc-cls { font-weight: 650; }
+.cyc-why { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.cyc-why.warn { color: var(--warn); }
+.cyc-probs { margin-top: 6px; display: grid; gap: 2px; font-size: 12px; }
+.pr { display: grid; grid-template-columns: 58px 1fr 34px; align-items: center; gap: 6px; }
+.pb { height: 8px; background: var(--ok); border-radius: 2px; }
+.pv { text-align: right; color: var(--muted); }

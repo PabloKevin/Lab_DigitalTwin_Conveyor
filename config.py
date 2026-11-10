@@ -351,6 +351,53 @@ CONTROLS = [
 ESTOP = dict(control="direction", value="S")
 
 # ════════════════════════════════════════════════════════════════════════════
+# CLASSIFICATION CYCLE (orchestrator.py) - the automatic sorting state machine
+#   IDLE -> RUN -> OBJECT_DETECTED -> CLASSIFYING -> (TO_ARM -> PUSHING) or TO_END -> RUN ...
+#   any fault / E-stop -> SAFE_STOP (belt stopped, arm STOP) until "Reset" on the page
+# One cube at a time between the camera and the arm. Distances in cm of belt travel (encoder).
+# ════════════════════════════════════════════════════════════════════════════
+CYCLE = dict(
+    model="classifier/models/cube_classifier.npz",   # NumPy CNN (python -m classifier.export, then copy here)
+    run_speed_pct=25,          # belt speed while the cycle runs (% of MAX_RPM)
+    stop_x_frac=0.5,           # stop when the cube centre reaches this fraction of the image width (0.5 = middle)
+    arm_margin_px=40,          # a cube must be seen at least this far BEFORE the stop line to be armed (no re-trigger)
+    stop_latency_s=0.25,       # frame age + command + motor stop; the stop command is sent this much earlier.
+                               # TUNE with logs/cycles.csv: x_final_px (camera) and arm_travel_cm - arm_distance_cm
+                               # (arm) should be ~0; positive = stopped too late -> increase, negative -> decrease
+    overshoot_px=80,           # cube found this far PAST the line before stopping -> missed (goes to the end)
+    settle_s=0.6,              # wait after stopping before taking the classification frames (no motion blur)
+    classify_timeout_s=4.0,    # no decision within this time (after settle) -> dudoso
+    arm_distance_cm=20.0,      # <<< MEASURE: belt distance from the stop line (image centre) to the arm's push point
+    clear_cm=12.0,             # cubes that are not pushed: belt travel before looking for the next cube
+    stopped_cm_s=0.8,          # |belt speed| below this = stopped
+    stop_timeout_s=3.0,        # stop commanded, measured speed still above stopped_cm_s after this -> fault.
+                               # The Arduino reports a FILTERED speed (EMA 0.2/0.8 at 10 Hz, 0 only after 400 ms
+                               # without encoder pulses), so "stopped" is seen ~1-1.5 s after the belt really stops
+    stall_s=3.0,               # belt commanded to run but not moving for this long -> fault
+    camera_timeout_s=2.0,      # no camera frame for this long while running -> fault
+    telemetry_timeout_s=2.0,   # no conveyor telemetry for this long (Live sync) -> fault
+    sim_push_s=2.5,            # Sandbox: the arm is simulated, "push" takes this long
+    log_csv="logs/cycles.csv", # one line per cube (times, class, latencies, deadline checks)
+    publish_topic=f"{TOPIC_PREFIX}/cycle",   # state + every decision are published here (JSON)
+    # Deadlines (lab section 6.1) checked for every cube; a miss is logged as a warning and counted
+    deadlines=dict(stop_s=2.0,       # stop command -> belt seen stopped (filtered speed, see stop_timeout_s)
+                   classify_s=3.0,   # stop command -> class decided
+                   arm_s=10.0),      # push command -> arm reports IDLE
+)
+
+# Robotic arm (EEZYbotARM Mk2, firmware coppeliaSim_panaderia_ws/firmware/esp32_eezybot_linear): plain-text MQTT.
+# Its MQTT_HOST must be this PC's IP (mosquitto.conf listens on the LAN).
+ARM = dict(
+    cmd_topic="eezybot/cmd",         # we send "PUSH1" / "PUSH2" / "STOP"
+    status_topic="eezybot/status",   # it answers "PUSH1 inicio", "DONE", "IDLE" (routine finished), "ERR ..."
+    online_topic="eezybot/online",   # retained "1" / "0"
+    routines={"solid": "PUSH1", "stripes": "PUSH2"},   # class -> routine; other classes / dudoso go to the belt end
+    done_text="IDLE",
+    error_prefix="ERR",
+    timeout_s=15.0,                  # push sent, no IDLE within this time -> fault
+)
+
+# ════════════════════════════════════════════════════════════════════════════
 # TWIN MODEL parameters (see twin_model.py -> step_model)
 # ════════════════════════════════════════════════════════════════════════════
 MODEL = dict(

@@ -18,6 +18,29 @@ class TestChecksum(unittest.TestCase):
             self.assertEqual(camserial.fletcher16(d), camserial.fletcher16_reference(d), n)
 
 
+class TestResultPackets(unittest.TestCase):
+    def test_result_and_face_packets(self):
+        """'R' (JSON) and 'F' (64x64 RGB face) from the classifier firmware, parsed between junk."""
+        import json
+        import numpy as np
+        cam = camserial.SerialCam.__new__(camserial.SerialCam)          # parser only, no port / thread
+        got = []
+        cam.on_result, cam.on_log, cam.result, cam.face = got.append, (lambda s: None), None, None
+        cam.frame, cam.stats, cam.status = None, dict(frames=0, bad=0, bytes=0, fps=0.0, kbps=0.0), ""
+        import threading
+        from collections import deque
+        cam._cv, cam._answers, cam._n_answers, cam._stamps = threading.Condition(), deque(), 0, deque(maxlen=30)
+        face = (np.arange(64 * 64 * 3) % 251).astype(np.uint8)
+        res = {"n": 7, "st": "ok", "p": [0.9, 0.05, 0.03, 0.02], "dec": "solid", "dest": "servo_1"}
+        buf = bytearray(b"junk" + camserial.build_packet(b"R", 1, 5, json.dumps(res).encode()) + b"\x00\xa5" +
+                        camserial.build_packet(b"F", 2, 5, face.tobytes()))
+        cam._parse(buf)
+        self.assertEqual(got[0]["dec"], "solid")
+        self.assertEqual(cam.result["dest"], "servo_1")
+        self.assertTrue((cam.face.reshape(-1) == face).all())
+        self.assertEqual(cam.face.shape, (64, 64, 3))
+
+
 class TestSerialCam(unittest.TestCase):
     def _cam(self, fake, **kw):
         cam = camserial.SerialCam(fake.port, settings={"saturation": 2, "quality": 12}, auto_reset_s=0,

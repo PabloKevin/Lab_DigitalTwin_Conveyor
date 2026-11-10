@@ -20,7 +20,10 @@ Use the conda env **`Control`** (TensorFlow 2.20, OpenCV with GUI), run from the
 | `augment.py` | frame-level scale ×0.7–1.3 + any rotation (camera height / pose) → re-detect; face-level rot90/flip, colour permutation, light, blur, noise, JPEG |
 | `train.py` | small CNN (61 k params), blocked K-fold CV + final model → `classifier/runs/<name>/` (report, confusion, errors) |
 | `live.py` | live test on the PC: camera → detection → CNN → 5-frame vote → class / dudoso + destination; keys 1..4 save the frame with its true class |
-| `tests/` | `python -m unittest discover -s classifier/tests -t .` |
+| `export.py` | Keras model → full-int8 TFLite + `model_data.h`, checks int8 = float, memory/MAC numbers (`export.json`) |
+| `fwgen.py` | writes `firmware/esp32_cam_classifier/params.h` from `params.json` and copies `model_data.h` there |
+| `device_live.py` | viewer for the ON-DEVICE classifier: results, face, votes, ESP32 stage timings, decision log |
+| `tests/` | `python -m unittest discover -s classifier/tests -t .` (includes the C++ ↔ Python parity test, needs g++) |
 
 ## How the cube is found
 Edges → solid mask → each blob's rotated rectangle must be a **square**: sides ratio ≤ `max_side_ratio`,
@@ -51,3 +54,12 @@ upright 64×64 image of the face only - no background, no rotation, no size (cla
 colour permutation (`--colour-perm 0.8`; the classes depend on which stickers share a colour, not on the colour).
 Validation is blocked cross-validation (contiguous blocks of shots per class) because consecutive shots are
 near-duplicates. Session 10 (95 faces): CV accuracy 0.79 with rotation + light only, 0.82 with colour permutation.
+
+## Running on the ESP32-CAM
+The detection is ported to C++ (`firmware/esp32_cam_classifier/facefind.cpp`, checked against `preprocess.py`
+on every dataset frame by `tests/test_facefind_parity.py`); the int8 model runs with the TFLite Micro + esp-nn that
+ship with the ESP32 Arduino core (no extra library).
+1. After training (or after changing `params.json`): `python -m classifier.export` then `python -m classifier.fwgen`.
+2. Arduino IDE: open `firmware/esp32_cam_classifier/`, board "AI Thinker ESP32-CAM" with PSRAM enabled, upload.
+3. `python -m classifier.device_live --url serial:/dev/ttyUSB0` (`--preview 0` for the fastest classification).
+Model on the device: 70 KB, ~82 KB of activations, 13.6 M multiply-adds per face; vote 2 of 3 frames.

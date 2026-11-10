@@ -19,7 +19,7 @@ def run(v, seq, center=(100, 80)):
 
 class TestVoter(unittest.TestCase):
     def v(self):
-        return Voter(C, n_frames=5, min_agree=4, tau=0.7)
+        return Voter(C, n_frames=5, min_agree=4, tau=0.7)   # rule logic; the real config is in params.json
 
     def test_clear_majority(self):
         out = run(self.v(), [S, S, T, S, S])

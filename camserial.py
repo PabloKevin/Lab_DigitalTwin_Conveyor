@@ -6,7 +6,8 @@ a USB-serial link (CH340, up to 2 Mbaud ~ 200 KB/s ~ 15+ fps of the 640x160 band
 
 Packet format (ESP32 -> PC, little-endian), must match the firmware:
     magic   4 B   A5 5A 43 4D               ("\\xa5\\x5aCM")
-    type    1 B   'J' JPEG frame | 'L' log text | 'A' command answer | 'R' result JSON (classifier firmware)
+    type    1 B   'J' JPEG frame | 'L' log text | 'A' command answer | 'R' result JSON | 'F' 64x64 RGB face
+                  ('R' and 'F' come from the classifier firmware, firmware/esp32_cam_classifier)
     seq     2 B   uint16, increments per packet
     ts_us   8 B   uint64, capture time in microseconds since the ESP32 booted (frames), send time otherwise
     len     4 B   uint32 payload length
@@ -102,12 +103,17 @@ class Frame:
 
 
 class SerialCam:
-    def __init__(self, port, baud=DEFAULT_BAUD, settings=None, on_log=None, fps=None, auto_reset_s=4.0):
+    def __init__(self, port, baud=DEFAULT_BAUD, settings=None, on_log=None, fps=None, auto_reset_s=4.0,
+                 stream=True, on_result=None):
         self.port, self.baud = port, baud
         self.settings = dict(settings or {})       # re-sent after every (re)connect / reboot
         self.fps = fps
         self.on_log = on_log or (lambda s: print(f"[esp32-cam] {s}"))
         self.auto_reset_s = auto_reset_s
+        self.stream = stream                       # send "stream 1" on connect (preview frames)
+        self.on_result = on_result                 # callback(dict) for every 'R' packet
+        self.result = None                         # latest 'R' (dict, + "arrival")
+        self.face = None                           # latest 'F' (64x64x3 RGB numpy)
         self.frame = None
         self.status = "connecting"
         self.stats = dict(frames=0, bad=0, bytes=0, fps=0.0, kbps=0.0)
@@ -206,7 +212,8 @@ class SerialCam:
             self._write(f"set {var} {int(val)}\n".encode())
         if self.fps is not None:
             self._write(f"fps {int(self.fps)}\n".encode())
-        self._write(b"stream 1\n")
+        if self.stream:
+            self._write(b"stream 1\n")
 
     def _run(self):
         while not self._stop:
@@ -264,7 +271,7 @@ class SerialCam:
             if len(buf) < 4 + HEAD.size:
                 return got_frame
             ptype, seq, ts_us, n = HEAD.unpack_from(buf, 4)
-            if n > MAX_PAYLOAD or ptype not in (b"J", b"L", b"A", b"R"):
+            if n > MAX_PAYLOAD or ptype not in (b"J", b"L", b"A", b"R", b"F"):
                 self.stats["bad"] += 1
                 del buf[:1]                          # false magic: resync
                 continue
@@ -280,7 +287,7 @@ class SerialCam:
             payload = body[HEAD.size:]
             del buf[:end]
             self._handle(ptype, seq, ts_us, payload)
-            got_frame |= ptype == b"J"
+            got_frame |= ptype in (b"J", b"R")         # results also mean "the camera is alive"
 
     def _handle(self, ptype, seq, ts_us, payload):
         now = time.time()
@@ -307,7 +314,22 @@ class SerialCam:
                 self._configure()
             self.on_log(txt)
         elif ptype == b"R":
-            self.on_log("result " + payload.decode("latin-1"))
+            import json
+            try:
+                res = json.loads(payload.decode("latin-1"))
+            except ValueError:
+                self.on_log("bad result JSON: " + payload[:80].decode("latin-1"))
+                return
+            res["arrival"] = now
+            with self._cv:
+                self.result = res
+                self._cv.notify_all()
+            if self.on_result:
+                self.on_result(res)
+        elif ptype == b"F":
+            side = int(round((len(payload) // 3) ** 0.5))
+            if side * side * 3 == len(payload):
+                self.face = np.frombuffer(payload, np.uint8).reshape(side, side, 3).copy()
 
 
 # One SerialCam per port, shared by vision.py and controls.py (only one process/thread may own the port)

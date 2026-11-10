@@ -31,6 +31,13 @@ class MqttBridge:
         self.client.on_message = self._on_message
         self.client.reconnect_delay_set(min_delay=1, max_delay=10)
         self._last_err = 0
+        self.listeners = {}                      # topic -> fn(text): e.g. the robotic arm's status (orchestrator.py)
+
+    def listen(self, topic, fn):
+        """Call fn(payload_text) for every message on `topic` (subscribed on every (re)connect)."""
+        self.listeners.setdefault(topic, []).append(fn)
+        if state.mqtt_connected:
+            self.client.subscribe(topic)
 
     # ── lifecycle ──────────────────────────────────────────────────────────
     def start(self):
@@ -46,7 +53,7 @@ class MqttBridge:
         state.log(f"MQTT connected to {cfg.MQTT['host']}:{cfg.MQTT['port']}")
         prefix = cfg.TOPIC_PREFIX + "/"
         client.subscribe(prefix + "#")                    # everything under the prefix (also feeds the MQTT monitor)
-        for topic in list(self.by_topic) + [cfg.STATUS_TOPIC]:
+        for topic in list(self.by_topic) + [cfg.STATUS_TOPIC] + list(self.listeners):
             if not topic.startswith(prefix):              # topics outside the prefix need their own subscription
                 client.subscribe(topic)
 
@@ -60,6 +67,12 @@ class MqttBridge:
         now = time.time()
         text = msg.payload.decode("utf-8", errors="replace").strip()
         state.raw[msg.topic] = (now, text)
+
+        for fn in self.listeners.get(msg.topic, []):
+            try:
+                fn(text)
+            except Exception as e:                       # noqa: BLE001 - a listener must never kill the MQTT thread
+                self._err(f"listener for {msg.topic} failed: {e}")
 
         if msg.topic == cfg.STATUS_TOPIC:
             state.device_status = text.lower()

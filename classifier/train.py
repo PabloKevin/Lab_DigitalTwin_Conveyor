@@ -130,10 +130,10 @@ def class_weights(y, n):
     return {i: len(y) / (n * max(c, 1)) for i, c in enumerate(cnt)}
 
 
-def fit(Xtr, ytr, n_classes, epochs, batch, seed, colour_perm=0.0):
+def fit(Xtr, ytr, n_classes, epochs, batch, seed, colour_perm=0.0, width=16):
     import keras
     keras.utils.set_random_seed(seed)
-    m = build_model(Xtr.shape[1], n_classes)
+    m = build_model(Xtr.shape[1], n_classes, width)
     m.fit(dataset(Xtr, ytr, batch, True, colour_perm), epochs=epochs, class_weight=class_weights(ytr, n_classes), verbose=0)
     return m
 
@@ -187,6 +187,8 @@ def main():
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--width", type=int, default=16,
+                    help="filters of the first conv (x1, x2, x4, x4); 8 = ~4x fewer operations on the ESP32")
     ap.add_argument("--colour-perm", type=float, default=0.8,
                     help="probability of a random colour permutation (0 = only rotation + light)")
     ap.add_argument("--recrop", action="store_true", help="re-run preprocess.py on the bands instead of saved crops")
@@ -207,7 +209,7 @@ def main():
     sheet(list(X[:10]) + list(sample[:10]), ["orig"] * 10 + ["aug"] * 10, os.path.join(a.out, "aug_preview.png"))
 
     report = dict(sessions=a.sessions, classes=classes, counts=counts, epochs=a.epochs, folds=a.folds,
-                  light_aug=LIGHT, rotations=[0, 90, 180, 270], colour_perm=a.colour_perm)
+                  light_aug=LIGHT, rotations=[0, 90, 180, 270], colour_perm=a.colour_perm, width=a.width)
     if not a.no_cv:
         fold = blocked_folds(y, t, a.folds)
         pred = np.full(len(y), -1)
@@ -216,7 +218,7 @@ def main():
         for k in range(a.folds):
             te = fold == k
             t0 = time.time()
-            m = fit(X[~te], y[~te], len(classes), a.epochs, a.batch, a.seed + k, a.colour_perm)
+            m = fit(X[~te], y[~te], len(classes), a.epochs, a.batch, a.seed + k, a.colour_perm, a.width)
             prob[te] = m.predict(X[te], verbose=0)
             pred[te] = prob[te].argmax(1)
             acc = float((pred[te] == y[te]).mean())
@@ -240,7 +242,7 @@ def main():
         report["cv_errors"] = [dict(id=ids[i], true=classes[y[i]], pred=classes[pred[i]], conf=float(conf[i]))
                                for i in wrong]
 
-    m = fit(X, y, len(classes), a.epochs, a.batch, a.seed, a.colour_perm)
+    m = fit(X, y, len(classes), a.epochs, a.batch, a.seed, a.colour_perm, a.width)
     m.save(os.path.join(a.out, "model.keras"))
     report["params"] = int(m.count_params())
     with open(os.path.join(a.out, "report.json"), "w") as f:

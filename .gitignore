@@ -7,3 +7,6 @@ secrets.h
 # Lab 03 classifier: raw dataset and training runs are big - kept out of git (zip them for the delivery)
 dataset/
 classifier/runs/
+
+# cycle logs of the orchestrator
+logs/

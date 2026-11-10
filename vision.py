@@ -140,6 +140,8 @@ def draw_overlay(img, objs, blobs=()):
         spd = "" if o["speed_cm_s"] is None else f"  {o['speed_cm_s']:+.1f}cm/s"
         cv2.putText(img, f"#{o['id']} {o['label']} {o['x_cm']:.1f}cm{spd}", (bx1, max(14, by1 - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1, cv2.LINE_AA)
+    if state.cycle_overlay is not None:              # stop line + classified face (orchestrator.py)
+        state.cycle_overlay(img)
     return img
 
 
@@ -433,6 +435,7 @@ class BgSubVision(VisionBase):
                 time.sleep(0.005)
                 continue
             frame, t, last_seq = reader.frame.copy(), reader.t, reader.seq
+            state.cam_frame = (frame.copy(), t, last_seq)   # raw frame for the cycle orchestrator (orchestrator.py)
             last_frame_t = time.time()
             state.vision_status = "streaming"
 
@@ -519,6 +522,8 @@ class SimVision(VisionBase):
             for o in out:
                 b = [int(x) for x in o["box"]]
                 cv2.rectangle(img, (b[0], b[1]), (b[2], b[3]), (60, 130, 220), -1)
+            self._sim_seq = getattr(self, "_sim_seq", 0) + 1
+            state.cam_frame = (img.copy(), now, self._sim_seq)
             self.show(img, out)
 
 
